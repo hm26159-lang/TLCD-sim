@@ -755,6 +755,10 @@ def lab(b,d,t,ag,title,out):
     settings.add(floor_page,text='층별 해석')
     masses0,ks0,hs0,mount0=b.floor_data()
     floor_fields={}
+    count_var=tk.StringVar(value=str(len(masses0)))
+    count_row=ttk.Frame(floor_page);count_row.pack(fill='x')
+    ttk.Label(count_row,text='건물 층수').pack(side='left')
+    ttk.Spinbox(count_row,from_=1,to=100000,textvariable=count_var,width=6).pack(side='right')
     for key,label,vals in [('m','층별 질량 (kg)',masses0),('k','층간 강성 (N/m)',ks0),('h','층 높이 (m)',hs0)]:
         row=ttk.Frame(floor_page);row.pack(fill='x',pady=2)
         ttk.Label(row,text=label).pack(side='left')
@@ -765,10 +769,11 @@ def lab(b,d,t,ag,title,out):
     row=ttk.Frame(floor_page);row.pack(fill='x',pady=2)
     ttk.Label(row,text='관 설치 층').pack(side='left')
     ttk.Entry(row,textvariable=mount_var,width=6).pack(side='right')
-    ttk.Label(floor_page,text='1층부터 쉼표로 입력 · 값 개수 = 층수').pack(anchor='w')
+    ttk.Label(floor_page,text='새 층은 바로 아래층의 값을 복사합니다.').pack(anchor='w')
     def three_floors():
         for key,values in [('m',MASSES),('k',STIFFNESSES),('h',HEIGHTS)]:
             floor_fields[key].set(', '.join(map(str,values)))
+        count_var.set(str(len(MASSES)))
         mount_var.set(str(INSTALL_FLOOR))
         calculate()
     ttk.Button(floor_page,text='코드 상단의 층별 예제 적용',command=three_floors).pack(fill='x')
@@ -1240,6 +1245,18 @@ def lab(b,d,t,ag,title,out):
             wb=float(omega_b.get())
             if not math.isfinite(wb) or wb<=0: raise ValueError('건물 각진동수는 양수여야 합니다.')
             lists={key:tuple(float(i.strip()) for i in field.get().split(',')) for key,field in floor_fields.items()}
+            wanted=int(count_var.get())
+            if wanted<1:raise ValueError('층수는 1 이상의 정수여야 합니다.')
+            previous=len(b.floor_data()[0])
+            if wanted!=previous:
+                for key,values in lists.items():
+                    if len(values) not in (previous,wanted):
+                        raise ValueError('층별 값은 기존 층수 또는 새 층수만큼 입력하세요.')
+                    lists[key]=(values+(values[-1],)*max(0,wanted-len(values)))[:wanted]
+                if wanted<previous and int(mount_var.get())==b.floor_data()[3]:
+                    mount_var.set(str(min(wanted,int(mount_var.get()))))
+            elif len(set(map(len,lists.values())))==1:
+                wanted=len(lists['m'])
             masses,ks,hs=lists['m'],lists['k'],lists['h'];count=len(masses);mount=int(mount_var.get())
             if len(ks)!=count or len(hs)!=count or not 1<=mount<=count:
                 raise ValueError('질량·강성·높이의 개수를 맞추고, 설치 층을 1층부터 마지막 층 사이로 입력하세요.')
@@ -1287,6 +1304,9 @@ def lab(b,d,t,ag,title,out):
             ag=signal
             b=target_b
             omega_b.set(f'{2*np.pi*b.frequency:.9g}')
+            count_var.set(str(count))
+            for key,values in [('m',masses),('h',hs)]:
+                floor_fields[key].set(', '.join(f'{v:.10g}' for v in values))
             floor_fields['k'].set(', '.join(f'{val:.10g}' for val in ks))
             scene.delete('all');objects.clear();previous_paint.clear();mesh_cache.clear()
             fields['h'].set(f'{dam.h*100:.9g}')
@@ -1424,6 +1444,8 @@ def lab(b,d,t,ag,title,out):
         bar=ttk.Frame(page);bar.pack(fill='x',padx=12,pady=5)
         options=['건물 변위','건물 가속도','물 높이 변화','옆 방향 변위','지면 입력 가속도','장치 없는 건물 변위','고정 질량 건물 변위']
         options+=['층별 상대변위','층별 절대가속도','층간변위비','층별 가속도 RMS']
+        compare_metrics=[(key,stat) for key in ('변위','절대가속도','층간변위') for stat in ('RMS','최대')]
+        options.extend(f'{key} {stat} 저감률 (%)' for key,stat in compare_metrics)
         var=tk.StringVar(value=options[7] if floor_view else options[0])
         picker=ttk.Combobox(bar,textvariable=var,values=options,state='readonly',width=24)
         picker.pack(side='left')
@@ -1447,6 +1469,26 @@ def lab(b,d,t,ag,title,out):
                 if kind>=7:
                     k=int(floor_number.get())-1;nf=r['floors_x'].shape[1]
                     name=f"{j+1} · {r['source']['wave']}"
+                    if kind>=11:
+                        metric,stat=compare_metrics[kind-11]
+                        if not r['valid']:
+                            peaks.append(name+' · 수면 한계로 제외');continue
+                        base,active=r['floor_bare'],r['floors_x']
+                        if metric=='절대가속도':base,active=r['floor_bare_acc'],r['floors_acc']
+                        elif metric=='층간변위':
+                            base=np.diff(base,axis=1,prepend=0.0)
+                            active=np.diff(active,axis=1,prepend=0.0)
+                        measure=lambda x:rms(x,r['t']) if stat=='RMS' else np.max(abs(x),axis=0)
+                        reference=measure(base)
+                        ratio=np.full(nf,np.nan)
+                        np.divide(measure(active),reference,out=ratio,where=reference>0)
+                        percent=100*(1-ratio)
+                        ax.plot(np.arange(nf)+1,percent,marker='o',label=name)
+                        if k>=nf:summary_value='층 없음'
+                        elif np.isfinite(percent[k]):summary_value=f'{percent[k]:+.2f}%'
+                        else:summary_value='기준 응답 0'
+                        peaks.append(f'{name} · {k+1}층 {summary_value}')
+                        continue
                     if kind==10:
                         if not r['valid']:peaks.append(name+' · 수면 한계');continue
                         ax.plot(np.arange(nf)+1,rms(r['floors_acc'],r['t']),marker='o',label=name)
@@ -1469,13 +1511,14 @@ def lab(b,d,t,ag,title,out):
                 ax.plot(r['t'],yy,label=f"{r['source']['wave']} · 실험 {j+1} · {'관 있음' if r.get('installed',True) else '관 없음'}",lw=1.7)
                 if r['valid'] or kind==4: peaks.append(f'실험 {j+1}   {np.nanmax(np.abs(yy)):.3g} {unit}')
                 else: peaks.append(f"실험 {j+1}   {r['failure_time']:.2f}초 수면 한계")
-            if kind==10:
+            if kind>=10:
                 max_floor=max((rows[j][1]['floors_x'].shape[1] for j in selection),default=1)
-                ax.set(xlabel='측정 층',ylabel='절대가속도 RMS (m/s²)',xticks=range(1,max_floor+1))
+                ax.set(xlabel='측정 층',ylabel=var.get() if kind>=11 else '절대가속도 RMS (m/s²)',xticks=range(1,max_floor+1))
             else:ax.set(xlabel='입력 시작 후 시간 (초)',ylabel=f'{var.get()} ({unit})')
             ax.spines[['top','right']].set_visible(False);ax.grid(axis='y',color='#d6e2e7')
             if ax.lines: ax.legend(ncol=min(3,len(ax.lines)))
-            note.set(('층별 RMS   ' if kind==10 else '최대 절댓값   ')+'     |     '.join(peaks))
+            if kind>=11:ax.axhline(0,color='#657780',lw=.8)
+            note.set(('장치 없음 대비 · 양수는 감소, 음수는 증가   |   ' if kind>=11 else '층별 RMS   ' if kind==10 else '최대 절댓값   ')+'     |     '.join(peaks))
             canvas.draw_idle()
         detail_bar=ttk.Frame(detail);detail_bar.pack(fill='x',padx=8,pady=4)
         labels=[label for label,_ in rows]
