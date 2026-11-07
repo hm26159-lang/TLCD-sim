@@ -65,6 +65,8 @@ class Building:
     damping: float = 0.02    # 구조물 감쇠비: 0.02 = 2%
     container_mass: float = 0.0  # 관 자체 질량 [kg], 실제 측정값으로 변경
 
+    width: float = .56  # 건물 가로(m)
+    depth: float = .44  # 건물 앞뒤(m)
     masses: tuple = ()
     stories: tuple = ()
     heights: tuple = ()
@@ -109,6 +111,18 @@ class Damper:
     shape: str = 'U형'
     tilt: float = 60.0  # V형 다리와 수평면 사이 각도
     reverse: bool = False
+    columns: int = 4
+    bores: tuple = ()  # 각 수직 기둥의 안지름(m). 빈 목록이면 공통 안지름.
+    tops: tuple = ()   # 각 바닥 관 중심부터 열린 끝까지의 높이(m).
+
+    def __post_init__(self):
+        for name in ('bores','tops'):
+            object.__setattr__(self,name,tuple(getattr(self,name)))
+
+    @property
+    def separate_u(self):
+        return self.shape=='독립 U관 3개' or (self.shape=='U형' and bool(self.bores or self.tops))
+
 
     @property
     def area(self):
@@ -129,7 +143,7 @@ class Damper:
 
     @property
     def frequency(self):
-        if self.shape!='U형':
+        if self.shape!='U형' or self.separate_u:
             mf,kf=network(self)[7:9]
             return math.sqrt(np.linalg.eigvals(np.linalg.solve(mf,kf)).real.min())/(2*np.pi)
         return math.sqrt(2 * G / self.length) / (2 * np.pi)
@@ -141,8 +155,14 @@ class Damper:
 
 
 def validate(b, d):
-    if not all(np.isfinite([b.mass,b.frequency,b.damping,b.container_mass])) or not all(np.isfinite([v for k,v in asdict(d).items() if k!="shape"])):
+    if not all(np.isfinite([b.mass,b.frequency,b.damping,b.container_mass])) or not all(np.isfinite([v for k,v in asdict(d).items() if k not in ("shape","bores","tops")])):
         raise ValueError('모든 매개변수는 유한한 수여야 합니다.')
+    if not all(np.isfinite(x) and x>0 for x in (b.width,b.depth)):
+        raise ValueError('건물 가로와 세로는 양수여야 합니다.')
+    if not isinstance(d.columns,int) or not 2<=d.columns<=24:
+        raise ValueError('다기둥형 기둥 수는 2~24 사이 정수로 입력하세요.')
+    if d.separate_u and min(d.B,d.h,d.diameter)>0:
+        u_dimensions(d)
     if d.shape not in SHAPES or not 0<d.tilt<=90: raise ValueError('관 종류와 V형 각도(0도 초과~90도)를 확인하세요.')
     if min(b.mass, b.frequency, d.B, d.h, d.diameter, d.freeboard) <= 0:
         raise ValueError('질량, 진동수, 길이와 지름은 양수여야 합니다.')
@@ -321,7 +341,7 @@ def metrics(result):
             'peak_reduction_vs_fixed_pct': reduction(peak, 1),
             'rms_reduction_vs_bare_pct': reduction(rms, 0),
             'acceleration_reduction_vs_bare_pct': reduction(acc, 0),
-            'peak_water_displacement_m': float(np.max(np.abs(result['state'][:, 2])))}
+            'peak_water_displacement_m': float(np.max(np.abs(result.get('levels',result['state'][:,2]))))}
 
 
 def setup_plot():
@@ -354,16 +374,17 @@ def draw_result(fig, axes, b, d, r, title):
     geometry, plan, disp, accel, water, info = axes
     for ax in axes:
         ax.clear()
-    if d.shape=='U형':draw_geometry(geometry,d)
+    if d.shape=='U형' and not d.separate_u:draw_geometry(geometry,d)
     else:
         feet,up,leg,starts,ends=network(d)[:5]
         geometry.remove();geometry=fig.add_subplot(3,2,1,projection='3d')
         for start,end in zip(starts,ends):
             geometry.plot(*np.stack((start,end)).T,color='#258aae',lw=5)
         for i,(start,direction) in enumerate(zip(feet,up)):
-            top=start+direction*(leg+d.freeboard/direction[2])
+            wet=np.broadcast_to(leg,len(feet))[i]
+            top=start+direction*(u_dimensions(d)[4][i] if d.separate_u else wet+d.freeboard/direction[2])
             geometry.plot(*np.stack((start,top)).T,color='#9bb2bf',lw=5)
-            geometry.plot(*np.stack((start,start+direction*leg)).T,color='#258aae',lw=3)
+            geometry.plot(*np.stack((start,start+direction*wet)).T,color='#258aae',lw=3)
             geometry.text(*top,str(i+1))
         geometry.set_title(d.shape+' · 기둥 번호');geometry.set_axis_off()
     theta = math.radians(d.angle)
@@ -448,6 +469,7 @@ def sweep(b, d, t, ag, folder=None):
         with (folder/'sweep.csv').open('w', newline='', encoding='utf-8-sig') as f:
             writer = csv.DictWriter(f, fieldnames=rows[0].keys()); writer.writeheader(); writer.writerows(rows)
     fig, ax = plt.subplots(figsize=(10, 4.5), layout='constrained')
+    pizza = d.shape=='피자 거치대'
     finite = np.abs(values[np.isfinite(values)])
     bound = max(float(np.max(finite)) if len(finite) else 1, 1)
     cmap = plt.get_cmap('RdBu').copy(); cmap.set_bad('#dddddd')
@@ -455,10 +477,11 @@ def sweep(b, d, t, ag, folder=None):
     for i in range(len(ratios)):
         for j in range(len(angles)):
             valid_run=rows[i*len(angles)+j]['valid']
-            label=f'{values[i,j]:+.1f}%' if np.isfinite(values[i,j]) else ('기준값 0' if valid_run else '한계 초과')
+            label=f'{values[i,j]:+.{3 if pizza else 1}f}%' if np.isfinite(values[i,j]) else ('기준값 0' if valid_run else '한계 초과')
             ax.text(j, i, label, ha='center', va='center', fontsize=9)
     ax.set(xticks=range(len(angles)), xticklabels=angles, yticks=range(len(ratios)), yticklabels=ratios,
-           xlabel='지진 방향과 설치 방향 사이 각도 [도]', ylabel='가로 길이 비율 B/L',
+           xlabel='지진 방향과 1번 가지 사이 각도 [도]' if pizza else '지진 방향과 설치 방향 사이 각도 [도]',
+           ylabel='바닥 세 가지의 길이 합 / 전체 물 길이' if pizza else '가로 길이 비율 B/L',
            title='최대 건물 변위 저감률 · 장치 없음 대비\n총 물 길이·물 질량 일정 / 양수: 감소, 음수: 악화')
     fig.colorbar(im, ax=ax, label='저감률 [%]')
     if folder is not None: fig.savefig(folder/'sweep.png', dpi=160)
@@ -468,11 +491,47 @@ def sweep(b, d, t, ag, folder=None):
 
 
 
-SHAPES=('U형','피자 거치대','V형','다기둥형')
+SHAPES=('U형','피자 거치대','V형','다기둥형','독립 U관 3개')
+
+def u_dimensions(d):
+    # 같은 물 질량으로 비교한다. 바닥 관 길이 합은 B, 수직 부분 물 부피 합은 2Ah.
+    spans=d.B*(np.array([.25,.25,.5]) if d.shape=='독립 U관 3개' else np.ones(1))
+    count=2*len(spans)
+    bores=np.array([d.diameter if x is None else x for x in d.bores] if d.bores else [d.diameter]*count,float)
+    if len(bores)!=count or not np.isfinite(bores).all() or min(bores)<=0:
+        raise ValueError(f'기둥 안지름은 양수 {count}개가 필요합니다.')
+    areas=np.pi*bores**2/4
+    # 각 독립 U관에 수직부 물 부피를 균등 배분. 연결된 좌우 수면은 정지 시 같은 높이.
+    rest=np.repeat(2*d.h*d.area/len(spans)/areas.reshape(-1,2).sum(axis=1),2)
+    if d.tops and len(d.tops)!=count:raise ValueError('기둥 높이 개수를 확인하세요.')
+    tops=np.array([rest[i]+d.freeboard if x is None else x for i,x in enumerate(d.tops)]) if d.tops else rest+d.freeboard
+    if len(tops)!=count or not np.isfinite(tops).all() or np.any(tops<=rest):
+        raise ValueError('각 기둥 끝은 정지 수면보다 높아야 합니다. 높이를 늘리거나 물을 줄이세요.')
+    return spans,bores,areas,rest,tops
+
+def independent_network(d):
+    spans,bores,areas,rest,tops=u_dimensions(d)
+    count=len(spans)
+    centers=np.zeros(count)
+    if count==3:
+        centers=np.array([-1,1,0])*(spans[0]/2+max(bores[:4])*.65)
+    base_z=np.array([0,0,max(tops[:4])+max(d.diameter,max(bores))]) if count==3 else np.zeros(1)
+    starts=np.column_stack([centers-spans/2,np.zeros(count),base_z])
+    ends=starts.copy();ends[:,0]+=spans
+    feet=np.stack([starts,ends],axis=1).reshape(-1,3)
+    up=np.tile([0.,0.,1.],(2*count,1))
+    # 각 자유도는 별도 U관의 바닥 물 이동거리. 좌우 체적 변화는 정확히 상쇄된다.
+    S=np.repeat(np.eye(count),2,axis=0)*(np.tile([-1,1],count)*d.area/areas)[:,None]
+    inertia=1000*(np.diag(d.area*spans)+S.T@((areas*rest)[:,None]*S))
+    spring=1000*G*S.T@(areas[:,None]*S)
+    coupling=1000*d.area*(ends-starts)[:,:2].T
+    return feet,up,rest,starts,ends,S,np.eye(count),inertia,spring,coupling
+
 
 def network(d):
     """각 가지의 물속 길이와 방향. 분기점에서 들어온 부피와 나간 부피가 같다."""
-    n={'피자 거치대':3,'다기둥형':4}.get(d.shape,2)
+    if d.separate_u:return independent_network(d)
+    n={'피자 거치대':3,'다기둥형':d.columns}.get(d.shape,2)
     leg=2*d.h/n
     surface=np.vstack([np.eye(n-1),-np.ones(n-1)])
     if d.shape=='피자 거치대':
@@ -521,6 +580,8 @@ def network_response(b,d,t,ag,installed=True):
     eff=np.linalg.inv(M); load=M@excitation
     # 전체 손실계수를 바닥 관 길이에 비례해 분배한다. 형상별 실측 보정값은 아니다.
     weights=.5*1000*d.area*d.loss*np.linalg.norm(ends-starts,axis=1)/d.B
+    if d.separate_u:weights=np.full(len(starts),.5*1000*d.area*d.loss)
+    clearance=u_dimensions(d)[4]-leg if d.separate_u else d.freeboard/up[0,2]
     def resistance(v):
         flow=T@v[fluid:]
         return T.T@(weights*abs(flow)*flow)
@@ -549,7 +610,7 @@ def network_response(b,d,t,ag,installed=True):
             mid=free-drag@(T.T@(weights*abs(flow)*flow))
             q=q+dt*mid;v=2*mid-v
             rise=S@q[fluid:]
-            if min(rise)<=-leg or max(rise)>=d.freeboard/up[0,2]:
+            if np.any(rise<=-leg) or np.any(rise>=clearance):
                 failure=t[i-1]+(j+1)*dt;break
         if failure is not None:break
         Q[i]=q;V[i]=v;nvalid+=1
@@ -586,7 +647,7 @@ def simulate_space(b, d, t, ag, installed=True):
             or not np.all(np.isfinite(t)) or not np.all(np.isfinite(ag))
             or np.any(np.diff(t) <= 0)):
         raise ValueError('시간은 증가해야 하며 각 시간에 가속도 하나가 필요합니다.')
-    if b.masses or (installed and d.shape!='U형'): return network_response(b,d,t,ag,installed)
+    if b.masses or d.separate_u or (installed and d.shape!='U형'): return network_response(b,d,t,ag,installed)
     theta = math.radians(d.angle)
     co, si = math.cos(theta), math.sin(theta)
     # 동일한 두 층 질량·층강성. 사용자가 설정한 값은 빈 건물의 1차 고유진동수다.
@@ -678,8 +739,8 @@ def export_space(folder, b, d, r, title):
             delimiter=',',comments='',header='time_s,'+','.join(f'column_{j+1}_height_m' for j in range(r['levels'].shape[1])))
     np.savetxt(Path(folder)/'spatial_motion.csv',
                np.column_stack((r['t'],r['ground'],r['first'],r['state'][:,0],r['lateral'][:,0],
-                                (r['rest_height']+r['levels'][:,0] if 'levels' in r else d.h-r['state'][:,2]) if r.get('installed',True) else np.full(len(r['t']),np.nan),
-                                (r['rest_height']+r['levels'][:,-1] if 'levels' in r else d.h+r['state'][:,2]) if r.get('installed',True) else np.full(len(r['t']),np.nan),
+                                (np.ravel(r['rest_height'])[0]+r['levels'][:,0] if 'levels' in r else d.h-r['state'][:,2]) if r.get('installed',True) else np.full(len(r['t']),np.nan),
+                                (np.ravel(r['rest_height'])[-1]+r['levels'][:,-1] if 'levels' in r else d.h+r['state'][:,2]) if r.get('installed',True) else np.full(len(r['t']),np.nan),
                                 r['acc'][:,2],r['lateral_acc'])),
                header='time_s,ground_displacement_m,floor1_relative_X_m,floor1_relative_Y_m,roof_X_m,roof_Y_m,left_water_height_m,right_water_height_m,absolute_ax_m_s2,absolute_ay_m_s2',
                delimiter=',',comments='')
@@ -735,6 +796,37 @@ def lab(b,d,t,ag,title,out):
     ttk.Label(tr,text='V형 경사각 (°)').pack(side='left')
     ttk.Entry(tr,textvariable=tilt_var,width=7).pack(side='right')
     ttk.Label(shape_page,text='같은 물을 각 기둥에 나눠 채웁니다.\n모양 비교 시 빈 관 질량도 고정합니다.').pack(anchor='w')
+    column_var=tk.StringVar(value=str(d.columns))
+    row=ttk.Frame(shape_page);row.pack(fill='x')
+    ttk.Label(row,text='다기둥형 기둥 수').pack(side='left')
+    ttk.Spinbox(row,from_=2,to=24,width=4,textvariable=column_var).pack(side='right')
+    leg_specs={d.shape:(d.bores,d.tops)}
+    def edit_legs():
+        shape=shape_var.get()
+        if shape not in ('U형','독립 U관 3개'):
+            messagebox.showinfo('기둥 설정','모양에서 U형 또는 독립 U관 3개를 선택하세요.');return
+        window=tk.Toplevel(root);window.title(shape+' 기둥 설정')
+        ttk.Label(window,text='안지름·전체 높이(cm) · 빈칸은 기본값\n높이는 바닥 관 중심부터 열린 끝까지입니다.').grid(row=0,column=0,columnspan=3)
+        for i,label in enumerate(('위치','안지름','전체 높이')):
+            ttk.Label(window,text=label).grid(row=1,column=i)
+        groups=['아래 왼쪽','아래 오른쪽','위'] if shape=='독립 U관 3개' else ['U관']
+        specs=leg_specs.get(shape,((),()))
+        entries=[[],[]]
+        for i in range(2*len(groups)):
+            ttk.Label(window,text=groups[i//2]+(' · 왼쪽',' · 오른쪽')[i%2]).grid(row=i+2,column=0)
+            for j in range(2):
+                val=tk.StringVar(value=f'{specs[j][i]*100:g}' if specs[j] and specs[j][i] else '')
+                entries[j].append(val);ttk.Entry(window,width=9,textvariable=val).grid(row=i+2,column=j+1)
+        def accept():
+            try:
+                values=[tuple(float(v.get())/100 if v.get().strip() else None for v in group) for group in entries]
+                if any(v is not None and (not math.isfinite(v) or v<=0) for group in values for v in group):raise ValueError()
+            except ValueError:
+                messagebox.showerror('값 확인','양수를 cm로 입력하세요.',parent=window);return
+            leg_specs[shape]=tuple(group if any(v is not None for v in group) else () for group in values)
+            window.destroy();calculate()
+        ttk.Button(window,text='적용',command=accept).grid(row=2+2*len(groups),column=0,columnspan=3)
+    ttk.Button(shape_page,text='U관 기둥별 안지름 · 높이',command=edit_legs).pack(fill='x')
     settings.add(pipe_page,text='관 설정');settings.add(quake_page,text='진원 · 세기')
     freq_page=ttk.Frame(settings,padding=6)
     settings.add(freq_page,text='각진동수')
@@ -770,6 +862,12 @@ def lab(b,d,t,ag,title,out):
     ttk.Label(row,text='관 설치 층').pack(side='left')
     ttk.Entry(row,textvariable=mount_var,width=6).pack(side='right')
     ttk.Label(floor_page,text='새 층은 바로 아래층의 값을 복사합니다.').pack(anchor='w')
+    size_row=ttk.Frame(floor_page);size_row.pack(fill='x')
+    size_vars=[]
+    for label,value in [('가로 cm',b.width),('세로 cm',b.depth)]:
+        ttk.Label(size_row,text=label).pack(side='left')
+        var=tk.StringVar(value=f'{100*value:g}');size_vars.append(var)
+        ttk.Entry(size_row,width=5,textvariable=var).pack(side='left')
     def three_floors():
         for key,values in [('m',MASSES),('k',STIFFNESSES),('h',HEIGHTS)]:
             floor_fields[key].set(', '.join(map(str,values)))
@@ -812,7 +910,8 @@ def lab(b,d,t,ag,title,out):
         if tune_mode.get(): return
         try:
             length=(float(fields['B'].get())+2*float(fields['h'].get()))/100
-            trial=replace(d,shape=shape_var.get(),B=float(fields['B'].get())/100,h=float(fields['h'].get())/100,tilt=float(tilt_var.get()))
+            bores,tops=leg_specs.get(shape_var.get(),((),()))
+            trial=replace(d,bores=bores,tops=tops,columns=int(column_var.get()),shape=shape_var.get(),B=float(fields['B'].get())/100,h=float(fields['h'].get())/100,tilt=float(tilt_var.get()))
             omega_l.set(f'{2*np.pi*trial.frequency:.9g}' if min(trial.B,trial.h,trial.tilt)>0 else '')
         except (ValueError,ZeroDivisionError): omega_l.set('')
     for key in ('B','h'): fields[key].trace_add('write',preview_frequency)
@@ -928,7 +1027,10 @@ def lab(b,d,t,ag,title,out):
             rot=np.array([[np.cos(az),np.sin(az),0],[-np.sin(az),np.cos(az),0],[0,0,1]])
             tubes=[]
             segments=[(a,b-a,None) for a,b in zip(starts,ends)]
-            segments.extend((a,u*(leg+dam.freeboard/u[2]),i) for i,(a,u) in enumerate(zip(feet,up)))
+            rest=np.broadcast_to(leg,len(feet))
+            tops=u_dimensions(dam)[4] if dam.separate_u else rest+dam.freeboard/up[:,2]
+            bores=u_dimensions(dam)[1] if dam.separate_u else np.full(len(feet),dam.diameter)
+            segments.extend((a,u*tops[i],i) for i,(a,u) in enumerate(zip(feet,up)))
             direction=np.array([np.sin(yaw)*np.cos(pitch),np.cos(yaw)*np.cos(pitch),np.sin(pitch)])
             for a,v,column in segments:
                 start=a@rot+[0,0,roof+dam.diameter/2]
@@ -936,13 +1038,13 @@ def lab(b,d,t,ag,title,out):
                 normal=np.cross(axis,[0,0,1] if abs(axis[2])<.98 else [0,1,0])
                 normal/=np.linalg.norm(normal);normal2=np.cross(axis,normal)
                 phi=np.arange(16)*2*np.pi/16
-                ring=dam.diameter/2*(np.cos(phi)[:,None]*normal+np.sin(phi)[:,None]*normal2)
+                ring=(dam.diameter if column is None else bores[column])/2*(np.cos(phi)[:,None]*normal+np.sin(phi)[:,None]*normal2)
                 tubes.append(((start+.5*vector)@direction,start@P,vector@P,ring@P,column))
-            mesh_cache[key]=(sorted(tubes,key=lambda v:v[0]),leg,up[0,2])
-        tubes,leg,slope=mesh_cache[key]
+            mesh_cache[key]=(sorted(tubes,key=lambda v:v[0]),rest*up[:,2],tops*up[:,2])
+        tubes,rest,tops=mesh_cache[key]
         for index,(_,base,span,ring,column) in enumerate(tubes):
             base=base+shift
-            fill=1 if column is None else (leg*slope+r['levels'][j,column])/(leg*slope+dam.freeboard)
+            fill=1 if column is None else (rest[column]+r['levels'][j,column])/tops[column]
             low=base+.86*ring;high=low+span*fill
             # 실루엣의 볼록 다각형은 두 원을 이은 원통의 정확한 선형 투영이다.
             length=np.linalg.norm(span)
@@ -975,7 +1077,7 @@ def lab(b,d,t,ag,title,out):
         dy=x*math.sin(bearing)+y*math.cos(bearing)
         story_z=np.r_[0,np.cumsum(r['story_height'])]
         nf=len(story_z)-1
-        bx,by,H=.28,.22,story_z[-1]
+        bx,by,H=b.width/2,b.depth/2,story_z[-1]
         yaw,pitch=camera
         cy,sy,cp,sp=math.cos(yaw),math.sin(yaw),math.cos(pitch),math.sin(pitch)
         ground=r['ground'][j]
@@ -984,8 +1086,11 @@ def lab(b,d,t,ag,title,out):
         first_x=fx*math.cos(bearing)-fy*math.sin(bearing)
         first_y=fx*math.sin(bearing)+fy*math.cos(bearing)
         # 바닥부터 관 끝까지의 범위와 이번 실험의 전체 이동량으로 한 번의 배율을 정한다.
-        half=max(.54,dam.B*.5+dam.diameter)+r['travel']
+        half=max(.54,np.hypot(bx,by)+.06,dam.B*.5+dam.diameter)+r['travel']
         top=H+dam.h+dam.freeboard+dam.diameter
+        if dam.separate_u:
+            feet=network(dam)[0]
+            top=H+max(feet[:,2]+u_dimensions(dam)[4])+dam.diameter
         scale=min(width*.65/(2.05*half),(height-62)/(top*cp+2*half*sp+.06))
         P=np.array([[cy,sy*sp],[-sy,cy*sp],[0,-cp]])*max(1,scale)
         fixed=np.array([width*.35,26+(top*cp+half*sp)*scale])
@@ -998,7 +1103,7 @@ def lab(b,d,t,ag,title,out):
         paint('stationary','line',ref.ravel().tolist(),fill='#8799a3',width=2,dash=(3,4))
         def slab(name,hx,hy,z,color):
             poly(name,[(-hx,-hy,z),(hx,-hy,z),(hx,hy,z),(-hx,hy,z)],color,'#899292')
-        slab('soil',.42,.32,-.026,'#c3bfaf')
+        slab('soil',bx+.14,by+.10,-.026,'#c3bfaf')
         slab('footing',bx+.025,by+.025,-.006,'#a6b2b5')
         for n in range(5):
             mark=np.array([[-.37+n*.18,.28,-.025],[-.35+n*.18,.28,-.025]])@P+origin
@@ -1030,7 +1135,7 @@ def lab(b,d,t,ag,title,out):
         # 내부 층에 설치한 관은 해당 층 위에 투시 표시한다.
         attach_z=story_z[r['mount']]
         dx,dy,_=wallpoint(0.,0.,attach_z)
-        if r.get('installed',True) and dam.shape!='U형':
+        if r.get('installed',True) and (dam.shape!='U형' or dam.separate_u):
             draw_network(dam,r,j,P,origin+np.array([dx,dy,0])@P,attach_z,meta['heading_deg'],yaw,pitch)
         elif r.get('installed',True):
             angle=math.radians(meta['heading_deg'] if 'levels' in r else meta['bearing_deg']+dam.angle)
@@ -1172,8 +1277,9 @@ def lab(b,d,t,ag,title,out):
             chart.create_text(61,pos,text=f'{bound*sign:.2g} {unit}',anchor='e')
         if idx>=5 and not off:colors=['#798898','#007db4']
         if idx==2 and 'levels' in r:
-            colors=['#256ca2','#dd882f','#24836b','#99568a'][:arrays.shape[1]]
-            legend.set('기둥 1 파랑 · 2 주황 · 3 초록 · 4 보라' if len(colors)==4 else ' · '.join(['기둥 1 파랑','2 주황','3 초록'][:len(colors)]))
+            palette=['#256ca2','#dd882f','#24836b','#99568a','#723db0','#ba3741']
+            colors=[palette[i%len(palette)] for i in range(arrays.shape[1])]
+            legend.set('기둥 번호순 · 파랑, 주황, 초록, 보라, 자주, 빨강 (반복)')
         for i,color in enumerate(colors):
             if off and idx==2: break
             yy=65-48*arrays[ids,i]/bound
@@ -1266,8 +1372,9 @@ def lab(b,d,t,ag,title,out):
             actual=modes(np.diag(masses),diff.T@(np.array(ks)[:,None]*diff))[0][0]
             if not math.isclose(wb,2*np.pi*b.frequency,rel_tol=1e-7):
                 ks=tuple(k*(wb/actual)**2 for k in ks);actual=wb
-            target_b=replace(b,mass=sum(masses),frequency=actual/(2*np.pi),masses=masses,stories=ks,heights=hs,mount=mount)
-            vals.update(shape=shape_var.get(),tilt=float(tilt_var.get()))
+            target_b=replace(b,width=float(size_vars[0].get())/100,depth=float(size_vars[1].get())/100,mass=sum(masses),frequency=actual/(2*np.pi),masses=masses,stories=ks,heights=hs,mount=mount)
+            bores,tops=leg_specs.get(shape_var.get(),((),()))
+            vals.update(shape=shape_var.get(),tilt=float(tilt_var.get()),columns=int(column_var.get()),bores=bores,tops=tops)
             if tune_mode.get():
                 wl=float(omega_l.get())
                 if not math.isfinite(wl) or wl<=0: raise ValueError('TLCD 각진동수는 양수여야 합니다.')
@@ -1310,6 +1417,7 @@ def lab(b,d,t,ag,title,out):
             floor_fields['k'].set(', '.join(f'{val:.10g}' for val in ks))
             scene.delete('all');objects.clear();previous_paint.clear();mesh_cache.clear()
             fields['h'].set(f'{dam.h*100:.9g}')
+            omega_l.set(f'{2*np.pi*dam.frequency:.9g}')
             r['building_spec']=target_b
             cache[key]=r; r['source']=meta; current[:]=[dam,r]
             source.set(f"{kind}  ·  {count}층 / 관 {mount}층   ·   진원 거리 {meta['distance_km']:.1f} km   ·   건물 입력 {meta['site_pga_g']:.4f} g   ·   관과 진동 방향 {relative:.1f}°")
@@ -1423,6 +1531,10 @@ def lab(b,d,t,ag,title,out):
               f"  ·  길이/물높이/지름 {dam.B*100:g}/{dam.h*100:g}/{dam.diameter*100:g} cm  ·  손실 {dam.loss:g}")
         mode=dam.shape if r.get('installed',True) else '관 없음'
         if mode=='관 없음': name=f"실험 {len(history)+1} | 진원 ({m['east']:g}, {m['north']:g}, 깊이 {m['depth']:g}) km · 기준 {m['strength']:g} g · 건물 {2*math.pi*b.frequency:.2f} rad/s"
+        if dam.shape=='다기둥형':mode+=f' {dam.columns}기둥'
+        if dam.separate_u and r.get('installed',True):
+            _,bores,_,_,tops=u_dimensions(dam)
+            name+=' · 기둥 안지름/높이(cm) '+', '.join(f'{w*100:g}/{h*100:g}' for w,h in zip(bores,tops))
         history.append((m['wave']+f" · {r['floors_x'].shape[1]}층 건물 · 설치 {r['mount']}층 · "+mode+' · '+name,r))
         status.set(f'실험 {len(history)} 저장됨 · 실험 그래프 비교에서 선택하세요.')
 
@@ -1547,7 +1659,7 @@ def lab(b,d,t,ag,title,out):
 
     def model_info():
         messagebox.showinfo('실험 모델',
-            '모양 선택만 바꾸면 물 총부피와 빈 관 질량이 유지됩니다. 바닥 총길이 B를 가지에 나누고, 기준 U형 물 높이 h의 두 배를 모든 다리에 나눕니다. V형은 수평 기준 경사각이며 피자 거치대는 120도 간격 3개, 다기둥형은 일렬 4개입니다. 모든 관은 같은 안지름입니다. 그림의 차단판 효과는 손실계수로 근사합니다.\n\n'
+            '모양 선택만 바꾸면 물 총부피와 빈 관 질량이 유지됩니다. 바닥 총길이 B를 가지에 나누고, 기준 U형 물 높이 h의 두 배를 모든 다리에 나눕니다. V형은 수평 기준 경사각이며 피자 거치대는 120도 간격 3개, 다기둥형은 일렬 2~24개입니다. 독립 U관 3개는 같은 설치 층에 고정되며 관마다 좌우 물 부피 변화가 상쇄됩니다. 기둥 안지름을 바꾸면 물의 양을 유지하도록 정지 수면을 다시 계산합니다. 그림의 차단판 효과는 손실계수로 근사합니다.\n\n'
             '진원 좌표는 건물을 기준으로 입력합니다. 가상 지진은 진원에서 건물로 향하는 수평선 방향으로 흔들린다고 가정합니다. 바로 아래 진원은 동쪽을 기준으로 사용합니다.\n\n'
             '세기는 진원 거리 10 km에서의 최대 가속도(g)입니다. 같은 파형에 거리 계수 √101 / √(거리²+1)을 곱합니다(거리 단위 km). 모든 기록은 진동 도착 시점부터 비교합니다. 실제 지반, 지진 규모, 파의 도착시간은 계산 범위 밖입니다.\n\n'
             '물은 관을 따라 움직이는 한 물기둥으로 계산합니다. 물의 관성, 두 수면 높이 차에 따른 중력, 유속의 제곱에 비례하는 저항이 들어갑니다. 3D 화면은 이 계산값을 보여줍니다.')
@@ -2159,5 +2271,3 @@ def main():
 
 if __name__=='__main__':
     main()
-
-
