@@ -264,7 +264,7 @@ def recorded_input():
 
 
 QUAKE_NOTES={
-    '단방향':'한 수평축을 따라 1 Hz로 반복하는 비교용 사인파입니다.',
+    '단방향':'입력한 Hz로 반복하는 일정 진폭 지반 가속도입니다. 정지 상태에서 출발하므로 건물 응답은 초기에 커질 수 있습니다.',
     '고베지진':'1995년 JMA 고베 남북 실측. 가까운 관측소에서 기록된 급격한 흔들림입니다. 첫 40초를 사용합니다.',
     '멕시코시티 지진':'1985년 호수 퇴적층 관측 특성을 본뜬 합성파입니다. 약 2초 주기 성분을 증폭해 길게 흔들립니다.',
     '엘센트로 지진':'1940년 엘센트로 남북 실측. 기존에 사용한 31.16초 기록입니다.'}
@@ -308,7 +308,10 @@ def quake_wave(kind, hz=1.):
         t=np.arange(len(a))*.02
     elif kind=='단방향':
         t=np.arange(1501)*.02
-        a=np.sin(2*np.pi*hz*t)*np.sin(np.pi*t/t[-1])**2
+        # 일정 진폭의 지반 가속도 조화 가진. 포락선과 기록 추세 보정을 적용하지 않는다.
+        if not np.isfinite(hz) or hz<=0:raise ValueError('진동수는 양수 Hz여야 합니다.')
+        a=np.cos(2*np.pi*hz*t)
+        return t,.03*G*a
     elif kind=='멕시코시티 지진':
         t=np.arange(3001)*.02
         rng=np.random.default_rng(1985)
@@ -358,6 +361,19 @@ def metrics(result):
             'rms_reduction_vs_bare_pct': reduction(rms, 0),
             'acceleration_reduction_vs_bare_pct': reduction(acc, 0),
             'peak_water_displacement_m': float(np.max(np.abs(result.get('levels',result['state'][:,2]))))}
+
+
+def partial_metrics(r):
+    if r['valid']:return dict(scope='전체 입력 구간',metrics=metrics(r))
+    end=r['n_valid']
+    if end<2 or r['t'][end-1]<=r['t'][0]:
+        return dict(scope='유효 동적 구간 없음',metrics=None)
+    clipped=dict(r)
+    for key in ('t','state','acc','levels'):
+        if key in clipped:clipped[key]=clipped[key][:end]
+    clipped['valid']=True
+    return dict(scope='모델 적용 가능 구간만; 전체 지진 성능 아님',
+        start_s=float(r['t'][0]),end_s=float(r['t'][end-1]),metrics=metrics(clipped))
 
 
 def setup_plot():
@@ -417,8 +433,10 @@ def draw_result(fig, axes, b, d, r, title):
     disp.set(title='건물의 지면 대비 변위', ylabel='변위 [mm]'); disp.legend(fontsize=8, ncol=3)
     accel.set(title='건물 절대가속도', ylabel='가속도 [g]')
     if 'levels' in r:
-        for j,level in enumerate(r['levels'].T):water.plot(r['t'],1000*level,label=f'기둥 {j+1}')
-        water.legend(fontsize=8);water.set(title='각 기둥의 수면 높이 변화',ylabel='수면 변화 [mm]')
+        for j,level in enumerate(r['levels'].T):water.plot(r['t'],1000*(level+np.broadcast_to(r['rest_height'],r['levels'].shape[1])[j]),label=f'기둥 {j+1}')
+        for bound in np.unique(r['lower_water']+r['rest_height']):water.axhline(bound*1000,color='red',ls='--')
+        for bound in np.unique(r['upper_water']+r['rest_height']):water.axhline(bound*1000,color='red',ls=':')
+        water.legend(fontsize=8);water.set(title='수면 높이 · 바닥 관 중심선 기준',ylabel='실제 높이 [mm]')
     else:
         water.plot(r['t'], 1000*r['state'][:, 2], color='#0284c7')
         for sign in [-1, 1]:
@@ -460,6 +478,11 @@ def save_result(folder, b, d, r, fig, title):
     payload['installed']=r.get('installed',True)
     if not payload['installed']: payload['damper']=None
     payload['source'] = r.get('source')
+    payload['failure_detail']=r.get('failure_detail')
+    payload['fluid_model']=r.get('fluid_model')
+    payload['geometry_scope']=r.get('geometry_scope')
+    payload['valid_interval_metrics']=partial_metrics(r)
+    payload['building_summary']=building_summary(b,r)
     (folder/'summary.json').write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
@@ -509,24 +532,38 @@ def sweep(b, d, t, ag, folder=None, metric="peak_reduction_vs_bare_pct"):
 
 
 
-def search_designs(b,d,t,ag,betas,angles,lengths):
+def search_designs(b,d,t,ag,betas,angles,lengths,require_peak=True):
     rows=[]
     for beta,angle,B in itertools.product(betas,angles,lengths):
+        row=dict(beta=float(beta),angle=float(angle),B=float(B),h=(d.length-B)/2,
+            mass_kg=d.mass,rms_pct=None,peak_pct=None,status='',reason='',eligible=False)
         try:
-            h=(d.length-B)/2
-            if h<=0:continue
-            test=replace(d,beta=float(beta),angle=float(angle),B=float(B),h=h)
+            test=replace(d,beta=float(beta),angle=float(angle),B=float(B),h=row['h'])
             validate(b,test)
             result=simulate_space(b,test,t,ag)
             m=metrics(result)
-            if m is None:continue
-            peak=m['peak_reduction_vs_bare_pct'];score=m['rms_reduction_vs_bare_pct']
-            if peak is None or score is None or peak < -1e-8:continue
-            rows.append(dict(beta=float(beta),angle=float(angle),B=float(B),h=h,
-                mass_kg=test.mass,rms_pct=score,peak_pct=peak))
-        except (ValueError,np.linalg.LinAlgError):
-            continue
-    return sorted(rows,key=lambda row:row['rms_pct'],reverse=True)
+            if m is None:
+                row.update(status=result.get('failure_kind','수면 상한 도달'),reason=result.get('failure_detail','수면 한계'))
+            else:
+                peak=m['peak_reduction_vs_bare_pct'];score=m['rms_reduction_vs_bare_pct']
+                row.update(rms_pct=score,peak_pct=peak,status='최대 변위 악화' if peak is not None and peak<0 else '정상')
+                row['eligible']=score is not None and peak is not None and (not require_peak or peak>=-1e-8)
+        except ValueError as error:
+            row.update(status='계산 오류' if '수렴' in str(error) else '잘못된 설계',reason=str(error))
+        except (np.linalg.LinAlgError,FloatingPointError) as error:
+            row.update(status='계산 오류',reason=str(error))
+        rows.append(row)
+    return sorted(rows,key=lambda r:(r['eligible'],r['rms_pct'] if r['rms_pct'] is not None else -np.inf),reverse=True)
+
+def building_summary(b,r):
+    mass,kx,heights,_=b.floor_data()
+    D=np.eye(len(mass))-np.eye(len(mass),k=-1)
+    ky=np.array(b.stories_y) if b.stories_y else kx
+    return dict(total_mass=float(sum(mass)),width=b.width,depth=b.depth,
+        fx=float(modes(np.diag(mass),D.T@(kx[:,None]*D))[0][0]/(2*np.pi)),
+        fy=float(modes(np.diag(mass),D.T@(ky[:,None]*D))[0][0]/(2*np.pi)),
+        peak_m=float(np.nanmax(abs(r['state'][:,0]))),
+        rms_m=float(rms(r['state'][:,0],r['t'])) if r['valid'] else None)
 
 
 SHAPES=('U형','피자 거치대','V형','다기둥형','독립 U관 3개')
@@ -632,12 +669,24 @@ def network_response(b,d,t,ag,installed=True):
     weights=np.full(len(starts),.5*1000*d.area*d.loss)
     if d.separate_u:weights=np.full(len(starts),.5*1000*d.area*d.loss)
     clearance=u_dimensions(d)[4]-leg if d.separate_u else d.freeboard/up[0,2]
+    # 일반 원형 U관의 보수적인 전단면 충수 적용 경계.
+    # 수평 관 중심선 z=0, 내측 천장 z=D/2. 접합부/자유수면의 3차원 형상은 미해석.
+    # 이는 공기 유입을 확정하는 실험식이 아니라 고전 물기둥 모델의 적용 제한이다.
+    standard_u=d.shape=='U형' and not d.separate_u
+    lower_rise=np.broadcast_to(-np.asarray(leg),S.shape[0]).copy()
+    if standard_u:lower_rise+=d.diameter/2
     q=np.zeros(size);v=np.zeros(size)
     Q=np.full((len(t),size),np.nan);V=Q.copy();Q[0]=q;V[0]=v
     fmax=np.sqrt(np.linalg.eigvals(eff@K).real.max())
     stepmax=min(.01,2*np.pi/(100*fmax))
-    nvalid=1;failure=None;last_h=None
+    nvalid=1;failure=None;failure_kind=None;failure_detail="";last_h=None
+    t=t.copy();ag=ag.copy()
+    if standard_u and np.any(lower_rise>=0):
+        failure=float(t[0]);failure_kind='모델 적용 범위 초과'
+        failure_detail=f'초기 상태 · 기둥 1·2 · h={d.h*1000:.3f} mm, 수평관 천장 D/2={d.diameter*500:.3f} mm. 전단면 충수를 보장할 수 없어 공기 유입 가능 상태의 유체 계산 제한.'
+
     for i,span in enumerate(np.diff(t),1):
+        if failure is not None:break
         count=max(1,int(np.ceil(span/stepmax-1e-10)));dt=span/count;h=dt/2
         if last_h is None or abs(last_h-h)>1e-13:
             inv=np.linalg.inv(M+h*C+h*h*K)
@@ -655,14 +704,44 @@ def network_response(b,d,t,ag,installed=True):
                 flow-=np.linalg.solve(np.eye(len(flow))+transfer*(2*weights*abs(flow)),residual)
             else:raise ValueError('유체 저항 계산이 수렴하지 않았습니다. 입력 조건을 확인하세요.')
             mid=free-drag@(T.T@(weights*abs(flow)*flow))
+            old_q=q.copy();old_v=v.copy()
             q=q+dt*mid;v=2*mid-v
             rise=S@q[fluid:]
-            if np.any(rise<=-leg) or np.any(rise>=clearance):
-                failure=t[i-1]+(j+1)*dt;break
+            if np.any(rise<=lower_rise) or np.any(rise>=clearance):
+                old_rise=S@old_q[fluid:]
+                lower=lower_rise
+                upper=np.broadcast_to(np.asarray(clearance),rise.shape)
+                candidates=[]
+                for column in range(len(rise)):
+                    bound=lower[column] if rise[column]<=lower[column] else upper[column]
+                    if rise[column]<=lower[column] or rise[column]>=upper[column]:
+                        fraction=(bound-old_rise[column])/(rise[column]-old_rise[column])
+                        candidates.append((float(np.clip(fraction,0,1)),column,rise[column]<=lower[column]))
+                fraction,column,is_lower=min(candidates)
+                q=old_q+fraction*(q-old_q);v=old_v+fraction*(v-old_v)
+                failure=t[i-1]+(j+fraction)*dt
+                failure_kind=('모델 적용 범위 초과' if standard_u else '수면 하한 도달') if is_lower else '수면 상한 도달'
+                failure_detail=f'{column+1}번 기둥 · {failure:.6f}초 (내부 단계 보간) · {failure_kind}'+(' · 수평관 천장에 수면 도달, 공기 유입 가능. 이후 부분 충수 모델 미검증.' if standard_u and is_lower else '')
+                ag[i]=ag[i-1]+(ag[i]-ag[i-1])*(failure-t[i-1])/span
+                t[i]=failure;Q[i]=q;V[i]=v;nvalid=i+1
+                break
         if failure is not None:break
         Q[i]=q;V[i]=v;nvalid+=1
-    force=-Q@K.T-V@C.T
-    currents=V[:,fluid:]@T.T
+    for indices in (np.r_[np.arange(2*n,3*n),np.arange(4*n,5*n)],
+                    np.r_[np.arange(3*n,4*n),np.arange(5*n,6*n)]):
+        mb=M[np.ix_(indices,indices)];kb=K[np.ix_(indices,indices)];cb=C[np.ix_(indices,indices)]
+        qb=np.zeros(2*n);vb=qb.copy();influence=np.r_[np.ones(n),np.zeros(n)]
+        Q[0,indices]=qb;V[0,indices]=vb
+        for i,span in enumerate(np.diff(t),1):
+            steps=max(1,int(np.ceil(span/stepmax)));dt=span/steps;half=dt/2
+            invb=np.linalg.inv(mb+half*cb+half*half*kb)
+            for j in range(steps):
+                gm=ag[i-1]+(ag[i]-ag[i-1])*(j+.5)/steps
+                midpoint=invb@(mb@vb-half*kb@qb-half*mb@influence*gm)
+                qb+=dt*midpoint;vb=2*midpoint-vb
+            Q[i,indices]=qb;V[i,indices]=vb
+    force=-np.nan_to_num(Q)@K.T-np.nan_to_num(V)@C.T
+    currents=np.nan_to_num(V[:,fluid:])@T.T
     force[:,fluid:]-=(weights*abs(currents)*currents)@T
     acc=force@eff.T
     heights=(Q[:,fluid:]@S.T)*up[:,2]
@@ -675,6 +754,11 @@ def network_response(b,d,t,ag,installed=True):
     return dict(t=t,ag=ag,ground=ground,first=Q[:,[0,n]],travel=travel,installed=installed,
         floors_x=floors_x,floors_y=floors_y,floors_acc=acc[:,:n],floor_bare=Q[:,2*n:3*n],
         floor_bare_acc=acc[:,2*n:3*n],story_height=story_height,mount=mount,
+        lower_water=lower_rise*up[:,2],upper_water=np.broadcast_to(clearance,len(up))*up[:,2],
+        fluid_model='고전 연속 물기둥 / 공기 유입 이후 미해석',
+        geometry_scope='수평관 천장 기준 보수적 충수 제한; 실제 접합부 공기 유입 시각 미확정' if standard_u else '기존 형상별 물기둥 근사',
+        failure_kind=failure_kind,failure_detail=failure_detail,
+        floor_bare_y=Q[:,4*n:5*n],
         levels=heights,rest_height=leg*up[0,2],
         state=np.column_stack([Q[:,roof],V[:,roof],heights[:,-1],speeds[:,-1],Q[:,bare],V[:,bare],Q[:,fixed],V[:,fixed]]),
         acc=acc[:,[bare,fixed,roof]],lateral=np.column_stack([Q[:,2*n-1],V[:,2*n-1]]),lateral_acc=acc[:,2*n-1],
@@ -684,7 +768,7 @@ def network_response(b,d,t,ag,installed=True):
 def simulate_space(b, d, t, ag, installed=True):
     """수평 두 방향의 지붕 운동과 두 수면의 연직 운동을 결합한다.
 
-    건물의 강성과 감쇠가 두 수평축에서 같다고 가정한다. 관과 나란한 축에서는
+    세계 X·Y 층별 강성을 가진 행렬을 가진 방향 좌표로 회전한다. 관과 나란한 축에서는
     물과 건물이 힘을 주고받고, 직각 축에서는 물도 건물에 실린 질량으로 움직인다.
     축별로 적분한 뒤 지진 방향 X와 횡방향 Y로 다시 회전한다.
     """
@@ -824,6 +908,14 @@ def lab(b,d,t,ag,title,out):
     settings.add(floor_page,text='층별 해석')
     masses0,ks0,hs0,mount0=b.floor_data()
     floor_fields={}
+    reference_size=(b.width,b.depth,masses0.copy())
+    size_link=tk.BooleanVar(value=False)
+    stiffness_mode=tk.StringVar(value='직접 입력')
+    ttk.Checkbutton(floor_page,text='건물 크기 연동 · 일정 단위면적 질량 가정',variable=size_link).pack(anchor='w')
+    ttk.Combobox(floor_page,textvariable=stiffness_mode,values=['직접 입력','목표 X 1차 진동수'],state='readonly',width=24).pack(anchor='w')
+    ttk.Label(floor_page,text='목표 모드에서는 X 강성만 같은 비율로 조정').pack(anchor='w')
+    frequency_note=tk.StringVar()
+    ttk.Label(floor_page,textvariable=frequency_note).pack(anchor='w')
     count_var=tk.StringVar(value=str(len(masses0)))
     count_row=ttk.Frame(floor_page);count_row.pack(fill='x')
     ttk.Label(count_row,text='건물 층수').pack(side='left')
@@ -984,6 +1076,8 @@ def lab(b,d,t,ag,title,out):
     ttk.Label(body,textvariable=legend).pack(anchor='w')
     pool=ThreadPoolExecutor(max_workers=1)
     current=[d,simulate_space(b,d,t,ag)]
+    initial_info=building_summary(b,current[1])
+    frequency_note.set(f"X 1차 {initial_info['fx']:.4f} Hz / Y 1차 {initial_info['fy']:.4f} Hz")
     current[1]['building_spec']=b
     current[1]['source']=dict(src.input_for(ag,d.angle)[2],wave=default_kind)
     history=[]
@@ -1237,7 +1331,7 @@ def lab(b,d,t,ag,title,out):
         if off and idx in (0,1): arrays=r['state'][:,0:1]*1000 if idx==0 else r['acc'][:,2:3]/G
         elif idx==0: arrays=r['state'][:,[4,6,0]]*1000
         elif idx==1: arrays=r['acc']/G
-        elif idx==2: arrays=r.get('levels',r['state'][:,2:3])*1000
+        elif idx==2: arrays=(r['levels']+r['rest_height'] if 'levels' in r else d.h+r['state'][:,2:3])*1000
         elif idx>=5:
             k=int(view_floor.get())-1
             base=r['floor_bare'];active=r['floors_x']
@@ -1263,6 +1357,7 @@ def lab(b,d,t,ag,title,out):
         stride=max(1,n//max(80,width//2))
         ids=np.unique(np.r_[np.arange(0,n,stride),n-1])
         bound=max(float(np.max(np.abs(arrays[:n]))),1e-10)
+        if idx==2 and 'lower_water' in r:bound=max(bound,float(np.max(abs(np.r_[r['lower_water']+r['rest_height'],r['upper_water']+r['rest_height']])))*1000)
         xx=65+(width-85)*(t[ids]-t[0])/(t[-1]-t[0])
         colors=['#798898','#d18534','#007db4'] if arrays.shape[1]==3 else ['#007db4']
         for sign in [-1,-.5,0,.5,1]:
@@ -1274,6 +1369,10 @@ def lab(b,d,t,ag,title,out):
             palette=['#256ca2','#dd882f','#24836b','#99568a','#723db0','#ba3741']
             colors=[palette[i%len(palette)] for i in range(arrays.shape[1])]
             legend.set('기둥 번호순 · 파랑, 주황, 초록, 보라, 자주, 빨강 (반복)')
+        if idx==2 and 'lower_water' in r:
+            for bound_value in np.r_[r['lower_water']+r['rest_height'],r['upper_water']+r['rest_height']]*1000:
+                y_limit=65-48*bound_value/bound
+                chart.create_line(65,y_limit,width-20,y_limit,fill='#b94a48',dash=(4,3))
         for i,color in enumerate(colors):
             if off and idx==2: break
             yy=65-48*arrays[ids,i]/bound
@@ -1294,7 +1393,11 @@ def lab(b,d,t,ag,title,out):
             a,_,z=m['peak_displacement_m']
             summary.set(f'최대 변위 · 지진 방향\n{a*1000:.2f} → {z*1000:.2f} mm\n\n장치 없음 대비 저감률\n최대 변위  {pct(m["peak_reduction_vs_bare_pct"])}\nRMS 변위  {pct(m["rms_reduction_vs_bare_pct"])}\n가속도  {pct(m["acceleration_reduction_vs_bare_pct"])}\n\n{dam.shape} · 물 {dam.mass:.3f} kg\n관 포함 {dam.mass+b.container_mass:.3f} kg')
         else:
-            summary.set(f'{r["failure_time"]:.2f}초에 수면 한계 도달\n여기까지 재생할 수 있어요.')
+            summary.set(r.get('failure_detail','수면 한계'))
+            partial=partial_metrics(r)
+            if partial['metrics']:
+                value=partial['metrics']['rms_reduction_vs_bare_pct']
+                summary.set(summary.get()+f"\n유효 구간만 RMS 저감 {value:+.2f}%" if value is not None else summary.get())
         scrub.configure(to=max(t[r['n_valid']-1],1e-12))
         position.set(0); draw_chart()
     def pause():
@@ -1362,9 +1465,14 @@ def lab(b,d,t,ag,title,out):
                 raise ValueError('질량·강성·높이의 개수를 맞추고, 설치 층을 1층부터 마지막 층 사이로 입력하세요.')
             if any(not math.isfinite(v) or v<=0 for arr in lists.values() for v in arr):
                 raise ValueError('질량, 강성, 높이는 모두 유한한 양수여야 합니다.')
+            if size_link.get():
+                refmass=reference_size[2]
+                if len(refmass)!=count:raise ValueError('크기 연동 기준 층수와 현재 층수가 다릅니다. 수동 모드를 사용하세요.')
+                factor=(float(size_vars[0].get())/100*float(size_vars[1].get())/100)/(reference_size[0]*reference_size[1])
+                masses=tuple(refmass*factor)
             diff=np.eye(count)-np.eye(count,k=-1)
             actual=modes(np.diag(masses),diff.T@(np.array(ks)[:,None]*diff))[0][0]
-            if not math.isclose(wb,2*np.pi*b.frequency,rel_tol=1e-7):
+            if stiffness_mode.get()=='목표 X 1차 진동수':
                 ks=tuple(k*(wb/actual)**2 for k in ks);actual=wb
             target_b=replace(b,stories_y=lists['y'],damping=float(damping_var.get()),width=float(size_vars[0].get())/100,depth=float(size_vars[1].get())/100,mass=sum(masses),frequency=actual/(2*np.pi),masses=masses,stories=ks,heights=hs,mount=mount)
             mass=float(water_var.get())
@@ -1420,7 +1528,7 @@ def lab(b,d,t,ag,title,out):
         def done(r):
             if len(cache)>=6: cache.clear()
             nonlocal ag,b,t
-            t=timeline
+            t=r["t"]
             ag=signal
             b=target_b
             omega_b.set(f'{2*np.pi*b.frequency:.9g}')
@@ -1435,9 +1543,12 @@ def lab(b,d,t,ag,title,out):
             r['building_spec']=target_b
             cache[key]=r; r['source']=meta; current[:]=[dam,r]
             source.set(f"{kind}  ·  {count}층 / 관 {mount}층   ·   진원 거리 {meta['distance_km']:.1f} km   ·   건물 입력 {meta['site_pga_g']:.4f} g   ·   관과 진동 방향 {relative:.1f}°")
+            model_info=building_summary(b,r)
+            frequency_note.set(f"X 1차 {model_info['fx']:.4f} Hz / Y 1차 {model_info['fy']:.4f} Hz")
+            r['building_summary']=model_info
             refresh()
             position.set(min(previous_time,t[r['n_valid']-1]));draw_scene()
-            status.set('계산 완료 · 비교 목록에 담을 수 있어요.')
+            status.set(r.get('failure_detail') or ('주의 · 정지 물높이 1 cm 미만' if dam.h<.01 else '계산 완료 · 비교 목록에 담을 수 있어요.'))
         task(lambda:cache[key] if key in cache else simulate_space(target_b,dam,timeline,signal,enabled),done)
     def save():
         path=filedialog.askdirectory(title='저장할 폴더 선택')
@@ -1454,6 +1565,8 @@ def lab(b,d,t,ag,title,out):
         win=tk.Toplevel(root);win.title('최적 설계 탐색')
         ttk.Label(win,text='각 행에 시작, 끝, 간격 입력 · B는 m · 동일 물 질량 / 최대 변위 증가 설계 제외').pack()
         controls=ttk.Frame(win);controls.pack()
+        require_peak=tk.BooleanVar(value=True)
+        ttk.Checkbutton(win,text='최대 변위가 증가한 설계는 최적 선정에서 제외',variable=require_peak).pack()
         entries={}
         for i,(key,text,default) in enumerate([('beta','개구비 β','.3,.5,.2'),('angle','각도 °','0,90,45'),('B','수평 길이 B (m)',f'{dam.B*.8:.6g},{dam.B*1.2:.6g},{dam.B*.4:.6g}')]):
             ttk.Label(controls,text=text).grid(row=i,column=0)
@@ -1461,13 +1574,24 @@ def lab(b,d,t,ag,title,out):
             ttk.Entry(controls,textvariable=v,width=25).grid(row=i,column=1)
         feedback=tk.StringVar(value='기본 18개 조합 · 간격을 줄이면 정밀 탐색합니다.')
         ttk.Label(win,textvariable=feedback).pack()
-        tree=ttk.Treeview(win,columns=('beta','angle','B','rms_pct','peak_pct'),show='headings',height=8)
-        for key,label in [('beta','개구비'),('angle','각도 °'),('B','B (m)'),('rms_pct','RMS 저감률 %'),('peak_pct','최대 저감률 %')]:
+        tree=ttk.Treeview(win,columns=('beta','angle','B','rms_pct','peak_pct','status','reason'),show='headings',height=8)
+        for key,label in [('beta','개구비'),('angle','각도 °'),('B','B (m)'),('rms_pct','RMS 저감률 %'),('peak_pct','최대 저감률 %'),('status','상태'),('reason','원인')]:
             tree.heading(key,text=label);tree.column(key,width=120)
         tree.pack(fill='x')
         fig=Figure(figsize=(7,3),constrained_layout=True);canvas=FigureCanvasTkAgg(fig,master=win)
         canvas.get_tk_widget().pack(fill='both',expand=True)
         found=[]
+        def count_combinations(*_):
+            try:
+                total=1
+                for value in entries.values():
+                    lo,hi,step=map(float,value.get().split(','))
+                    if not all(np.isfinite([lo,hi,step])) or step<=0 or hi<lo:raise ValueError()
+                    total*=int(np.floor((hi-lo)/step+1e-8))+1
+                feedback.set(f'실제 계산 조합 {total}개 · 시작, 끝, 간격 순서로 입력')
+            except ValueError:feedback.set('시작, 끝, 간격을 쉼표로 구분해 입력하세요.')
+        for value in entries.values():value.trace_add('write',count_combinations)
+        count_combinations()
         def start():
             try:
                 grids=[]
@@ -1483,20 +1607,31 @@ def lab(b,d,t,ag,title,out):
             def show(rows):
                 if not win.winfo_exists():return
                 found[:]=rows;tree.delete(*tree.get_children());fig.clear()
-                for row in rows[:30]:tree.insert('','end',values=[f'{row[k]:.5g}' for k in ('beta','angle','B','rms_pct','peak_pct')])
+                for row in rows:tree.insert('','end',values=[f'{row[k]:.5g}' if isinstance(row[k],float) else ('—' if row[k] is None else row[k]) for k in ('beta','angle','B','rms_pct','peak_pct','status','reason')])
                 if not rows:feedback.set('제약조건을 만족한 설계 없음');canvas.draw_idle();return
-                best=rows[0]
-                feedback.set(f"최적 β={best['beta']:.4g}, 각도={best['angle']:g}°, B={best['B']:.4g} m · RMS {best['rms_pct']:+.3f}%, 최대 {best['peak_pct']:+.3f}%")
-                ax=fig.subplots()
+                eligible=[row for row in rows if row['eligible']]
+                counts={key:sum(row['status']==key for row in rows) for key in set(row['status'] for row in rows)}
+                if not eligible:
+                    feedback.set('유효 최적 설계 없음 · '+str(counts))
+                best=eligible[0] if eligible else None
+                if best:feedback.set(f"최적 β={best['beta']:.4g}, 각도={best['angle']:g}°, B={best['B']:.4g} m · RMS {best['rms_pct']:+.3f}%, 최대 {best['peak_pct']:+.3f}%")
+                ax,trace=fig.subplots(1,2)
                 xs=sorted(set(r['angle'] for r in rows));ys=sorted(set(r['B'] for r in rows))
                 values=np.full((len(ys),len(xs)),np.nan)
                 for row in rows:
+                    if row['rms_pct'] is None:continue
                     i,j=ys.index(row['B']),xs.index(row['angle'])
                     if not np.isfinite(values[i,j]) or row['rms_pct']>values[i,j]:values[i,j]=row['rms_pct']
                 im=ax.imshow(values,aspect='auto',cmap='RdBu')
                 ax.set(xticks=range(len(xs)),xticklabels=xs,yticks=range(len(ys)),yticklabels=[f'{v:.3g}' for v in ys],xlabel='각도 °',ylabel='B (m)',title='각 칸에서 가장 좋은 개구비의 RMS 저감률')
-                fig.colorbar(im,ax=ax,label='%');canvas.draw_idle()
-            task(lambda:search_designs(model,dam,times,wave,*grids),show)
+                fig.colorbar(im,ax=ax,label='%')
+                if best:
+                    result=simulate_space(model,replace(dam,beta=best['beta'],angle=best['angle'],B=best['B'],h=best['h']),times,wave)
+                    trace.plot(result['t'],result['state'][:,4]*1000,label='장치 없음')
+                    trace.plot(result['t'],result['state'][:,0]*1000,label='최적 설계')
+                    trace.legend();trace.set(xlabel='시간 (s)',ylabel='지붕 변위 (mm)')
+                canvas.draw_idle()
+            task(lambda:search_designs(model,dam,times,wave,*grids,require_peak=require_peak.get()),show)
         def save_search():
             if not found:return
             path=filedialog.asksaveasfilename(parent=win,defaultextension='.csv')
@@ -1620,6 +1755,26 @@ def lab(b,d,t,ag,title,out):
         win=tk.Toplevel(root);win.title('실험 그래프 비교');win.geometry('1040x700')
         book=ttk.Notebook(win);book.pack(fill='both',expand=True)
         page=ttk.Frame(book);detail=ttk.Frame(book)
+        report=ttk.Frame(book);book.add(report,text='X·Y 층별 / 크기 비교')
+        report_columns=('experiment','direction','floor','rms','peak','drift','mass','fx','fy','roof_peak','roof_rms')
+        table=ttk.Treeview(report,columns=report_columns,show='headings')
+        for key,title in zip(report_columns,['실험','방향','층','RMS 저감 %','최대 저감 %','최대 층간비 %','총질량 kg','X 1차 Hz','Y 1차 Hz','지붕 최대 m','지붕 RMS m']):
+            table.heading(key,text=title);table.column(key,width=100)
+        scrollbar=ttk.Scrollbar(report,orient='horizontal',command=table.xview)
+        table.configure(xscrollcommand=scrollbar.set);scrollbar.pack(side='bottom',fill='x');table.pack(fill='both',expand=True)
+        for index,(_,run) in enumerate(history,1):
+            spec=run['building_spec'];info=building_summary(spec,run)
+            co,si=np.cos(np.radians(spec.bearing)),np.sin(np.radians(spec.bearing))
+            for direction,active,base in [('X',run['floors_x']*co-run['floors_y']*si,run['floor_bare']*co-run['floor_bare_y']*si),
+                                          ('Y',run['floors_x']*si+run['floors_y']*co,run['floor_bare']*si+run['floor_bare_y']*co)]:
+                for floor in range(active.shape[1]):
+                    ar=rms(active[:,floor],run['t']) if run['valid'] else None
+                    br=rms(base[:,floor],run['t'])
+                    peak=np.max(abs(active[:,floor])) if run['valid'] else None
+                    bp=np.max(abs(base[:,floor]))
+                    drift=np.nanmax(abs(active[:,floor]-(active[:,floor-1] if floor else 0)))/run['story_height'][floor]*100 if run['valid'] else None
+                    values=[index,direction,floor+1,100*(1-ar/br) if ar is not None and br>1e-12 else None,100*(1-peak/bp) if peak is not None and bp>1e-12 else None,drift,info['total_mass'],info['fx'],info['fy'],info['peak_m'],info['rms_m']]
+                    table.insert('','end',values=['—' if v is None else f'{v:.5g}' if isinstance(v,float) else v for v in values])
         book.add(page,text='실험 그래프');book.add(detail,text='U형 설계 · 모드 분석')
         ttk.Label(page,text='함께 볼 실험을 클릭하세요. 다시 클릭하면 선택이 풀려요.').pack(anchor='w',padx=12,pady=5)
         items=tk.Listbox(page,selectmode='multiple',exportselection=False,height=5)
@@ -1944,6 +2099,7 @@ def integrate(model,p,t,ag,forces,*,rest=False):
                 # 유체 중점 속도 w + loss[-1]*|w|w = mid[-1]의 안정적인 닫힌 해.
                 w=2*mid[-1]/(1+math.sqrt(1+4*loss[-1]*abs(mid[-1])))
                 mid-=loss*(abs(w)*w)
+            old_q=q.copy();old_v=v.copy()
             q=q+dt*mid;v=2*mid-v
             if p and abs(q[-1])>=limit:
                 stop=float(t[i-1]+(j+1)*dt);break
