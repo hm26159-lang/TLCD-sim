@@ -24,13 +24,13 @@ HEIGHTS = [.40, .38, .36]                # 각 층 사이의 높이(m). 층간�
 RAYLEIGH_A, RAYLEIGH_B = .12, .0015     # 각각 1/s, s. C = a M + b K
 CUSTOM_C = None                          # 직접 지정하려면 n×n 대칭 행렬(N·s/m)
 INSTALL_FLOOR = 3                        # 기준 U형 설치 층. 화면은 1층부터 시작
-REFERENCE = dict(L=.50, B=.30, A=.002, Ao=.00080, rho=1000., sigma=12.)
+REFERENCE = dict(L=.50, B=.30, A=.002, rho=1000., beta=.4)
 # 설계별로 아래 목록의 모든 조합을 계산한다. 층은 1부터 입력한다.
 FLOORS = [1, 3]
 L_VALUES = [.42, .60]
 B_VALUES = [.28]
-AO_VALUES = [.00065, .00095]
-SIGMA_VALUES = [12.]
+
+BETA_VALUES = [.3,.5]
 KEEP_WATER_MASS = True                   # True: L이 달라지면 A를 바꿔 기준 물 질량 유지
 CUSTOM_AREA = .002                       # False일 때 쓰는 단면적(m²)
 CUSTOM_DENSITY = 1000.                    # kg/m³
@@ -67,13 +67,15 @@ class Building:
 
     width: float = .56  # 건물 가로(m)
     depth: float = .44  # 건물 앞뒤(m)
+    stories_y: tuple = ()
+    bearing: float = 0.
     masses: tuple = ()
     stories: tuple = ()
     heights: tuple = ()
     mount: int = 0  # 0이면 지붕
 
     def __post_init__(self):
-        for key in ('masses','stories','heights'):
+        for key in ('masses','stories','stories_y','heights'):
             object.__setattr__(self,key,tuple(getattr(self,key)))
         if self.masses or self.stories or self.heights:
             n=len(self.masses)
@@ -105,7 +107,7 @@ class Damper:
     h: float = 0.10          # 바닥 중심선부터 정지 수면까지 높이 [m]
     diameter: float = 0.05   # 원형 관의 안지름 [m], 모든 구간 일정
     angle: float = 0.0       # 지진 방향과 관의 수평축 사이 각도 [도]
-    loss: float = 5.0        # 전체 손실계수. 형상별 실험 보정이 필요
+    beta: float = .4         # 오리피스 면적 / 유로 단면적
     freeboard: float = 0.12  # 정지 수면 위 여유 높이 [m]
 
     shape: str = 'U형'
@@ -123,6 +125,10 @@ class Damper:
     def separate_u(self):
         return self.shape=='독립 U관 3개' or (self.shape=='U형' and bool(self.bores or self.tops))
 
+
+    @property
+    def loss(self):
+        return orifice_loss(self.beta)
 
     @property
     def area(self):
@@ -154,7 +160,17 @@ class Damper:
         return min(self.h, self.freeboard)
 
 
+def orifice_loss(beta):
+    if not np.isfinite(beta) or not 0<beta<=1:
+        raise ValueError('오리피스 개구비 β는 0 초과, 1 이하여야 합니다.')
+    psi=1-beta
+    return (psi+.707*psi**.375)**2/beta**2
+
 def validate(b, d):
+    orifice_loss(d.beta)
+    if b.stories_y and (len(b.stories_y)!=len(b.floor_data()[0]) or any(not np.isfinite(x) or x<=0 for x in b.stories_y)):
+        raise ValueError('Y방향 강성은 층마다 양수를 하나씩 입력하세요.')
+
     if not all(np.isfinite([b.mass,b.frequency,b.damping,b.container_mass])) or not all(np.isfinite([v for k,v in asdict(d).items() if k not in ("shape","bores","tops")])):
         raise ValueError('모든 매개변수는 유한한 수여야 합니다.')
     if not all(np.isfinite(x) and x>0 for x in (b.width,b.depth)):
@@ -254,7 +270,7 @@ QUAKE_NOTES={
     '엘센트로 지진':'1940년 엘센트로 남북 실측. 기존에 사용한 31.16초 기록입니다.'}
 # JMA Kobe: https://www.data.jma.go.jp/eqev/data/kyoshin/jishin/hyogo_nanbu/index.html
 # Mexico City: USGS OFR 85-731 그림 3. 관측 지반의 장주기 성분을 설명하는 교육용 모델.
-def quake_wave(kind):
+def quake_wave(kind, hz=1.):
     if kind=='엘센트로 지진':return recorded_input()
     if kind=='고베지진':
         import base64,zlib
@@ -292,7 +308,7 @@ def quake_wave(kind):
         t=np.arange(len(a))*.02
     elif kind=='단방향':
         t=np.arange(1501)*.02
-        a=np.sin(2*np.pi*t)*np.sin(np.pi*t/t[-1])**2
+        a=np.sin(2*np.pi*hz*t)*np.sin(np.pi*t/t[-1])**2
     elif kind=='멕시코시티 지진':
         t=np.arange(3001)*.02
         rng=np.random.default_rng(1985)
@@ -440,13 +456,14 @@ def save_result(folder, b, d, r, fig, title):
     payload = {'building': asdict(b), 'damper': asdict(d), 'input': title,
                'valid': r['valid'], 'failure_time_s': r['failure_time'],
                'metric_array_order': ['bare', 'fixed_mass', 'tlcd'], 'metrics': metrics(r)}
+    payload['orifice']=dict(beta=d.beta,xi=d.loss,velocity_basis='mean conduit velocity',model='orifice only; branching applicability unvalidated')
     payload['installed']=r.get('installed',True)
     if not payload['installed']: payload['damper']=None
     payload['source'] = r.get('source')
     (folder/'summary.json').write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
-def sweep(b, d, t, ag, folder=None):
+def sweep(b, d, t, ag, folder=None, metric="peak_reduction_vs_bare_pct"):
     """총 물 길이와 지름을 유지하면서 B/L과 설치 각도를 비교한다."""
     plt = setup_plot()
     ratios = np.array([0.35, 0.50, 0.65, 0.80])
@@ -458,10 +475,11 @@ def sweep(b, d, t, ag, folder=None):
             test = replace(d, B=d.length*ratio, h=d.length*(1-ratio)/2, angle=float(angle))
             r = simulate_space(b, test, t, ag); m = metrics(r)
             if m is not None and m['peak_reduction_vs_bare_pct'] is not None:
-                values[i, j] = m['peak_reduction_vs_bare_pct']
+                values[i, j] = m[metric]
             rows.append({'B_over_L': ratio, 'angle_deg': angle, 'B_m': test.B, 'h_m': test.h,
                          'water_mass_kg': test.mass, 'valid': r['valid'],
-                         'peak_reduction_vs_bare_pct': values[i, j],
+                         'peak_reduction_vs_bare_pct': m['peak_reduction_vs_bare_pct'] if m else '',
+                         'rms_reduction_vs_bare_pct': m['rms_reduction_vs_bare_pct'] if m else '',
                          'peak_reduction_vs_fixed_pct': m['peak_reduction_vs_fixed_pct'] if m else '',
                          'acceleration_reduction_vs_bare_pct': m['acceleration_reduction_vs_bare_pct'] if m else ''})
     if folder is not None:
@@ -482,13 +500,33 @@ def sweep(b, d, t, ag, folder=None):
     ax.set(xticks=range(len(angles)), xticklabels=angles, yticks=range(len(ratios)), yticklabels=ratios,
            xlabel='지진 방향과 1번 가지 사이 각도 [도]' if pizza else '지진 방향과 설치 방향 사이 각도 [도]',
            ylabel='바닥 세 가지의 길이 합 / 전체 물 길이' if pizza else '가로 길이 비율 B/L',
-           title='최대 건물 변위 저감률 · 장치 없음 대비\n총 물 길이·물 질량 일정 / 양수: 감소, 음수: 악화')
+           title=('RMS' if metric.startswith('rms') else '최대')+' 건물 변위 저감률 · 장치 없음 대비\n총 물 길이·물 질량 일정 / 양수: 감소, 음수: 악화')
     fig.colorbar(im, ax=ax, label='저감률 [%]')
     if folder is not None: fig.savefig(folder/'sweep.png', dpi=160)
     plt.close(fig)
     return fig
 
 
+
+
+def search_designs(b,d,t,ag,betas,angles,lengths):
+    rows=[]
+    for beta,angle,B in itertools.product(betas,angles,lengths):
+        try:
+            h=(d.length-B)/2
+            if h<=0:continue
+            test=replace(d,beta=float(beta),angle=float(angle),B=float(B),h=h)
+            validate(b,test)
+            result=simulate_space(b,test,t,ag)
+            m=metrics(result)
+            if m is None:continue
+            peak=m['peak_reduction_vs_bare_pct'];score=m['rms_reduction_vs_bare_pct']
+            if peak is None or score is None or peak < -1e-8:continue
+            rows.append(dict(beta=float(beta),angle=float(angle),B=float(B),h=h,
+                mass_kg=test.mass,rms_pct=score,peak_pct=peak))
+        except (ValueError,np.linalg.LinAlgError):
+            continue
+    return sorted(rows,key=lambda row:row['rms_pct'],reverse=True)
 
 
 SHAPES=('U형','피자 거치대','V형','다기둥형','독립 U관 3개')
@@ -559,7 +597,7 @@ def network_response(b,d,t,ag,installed=True):
     feet,up,leg,starts,ends,S,T,fluid_mass,fluid_k,coupling=network(d)
     modes=S.shape[1]
     masses,stiffness,story_height,mount=b.floor_data()
-    n=len(masses); fluid=4*n; size=fluid+modes
+    n=len(masses); fluid=6*n; size=fluid+modes
     added=d.mass+b.container_mass if installed else 0.
     M=np.eye(size);K=np.zeros_like(M);C=K.copy()
     omega=2*np.pi*b.frequency
@@ -570,21 +608,30 @@ def network_response(b,d,t,ag,installed=True):
         M[j+mount-1,j+mount-1]+=extra
         K[j:j+n,j:j+n]=story
         C[j:j+n,j:j+n]=2*b.damping/omega*story
+    ky=np.array(b.stories_y) if b.stories_y else stiffness
+    story_y=difference.T@(ky[:,None]*difference)
+    theta=np.radians(b.bearing);co,si=np.cos(theta),np.sin(theta)
+    xx=co*co*story+si*si*story_y
+    yy=si*si*story+co*co*story_y
+    xy=co*si*(story_y-story)
+    for ix,iy,extra in ((0,n,added),(2*n,4*n,0),(3*n,5*n,added)):
+        M[iy:iy+n,iy:iy+n]=np.diag(masses)
+        M[iy+mount-1,iy+mount-1]+=extra
+        K[ix:ix+n,ix:ix+n]=xx;K[iy:iy+n,iy:iy+n]=yy
+        K[ix:ix+n,iy:iy+n]=xy;K[iy:iy+n,ix:ix+n]=xy
+    C[:fluid,:fluid]=2*b.damping/omega*K[:fluid,:fluid]
     a=np.radians(d.angle+180*d.reverse)
     rot=np.array([[np.cos(a),-np.sin(a)],[np.sin(a),np.cos(a)]])
     cross=rot@coupling if installed else np.zeros_like(coupling)
     attached=[mount-1,n+mount-1]
     M[attached,fluid:]=cross;M[fluid:,attached]=cross.T
     M[fluid:,fluid:]=fluid_mass;K[fluid:,fluid:]=fluid_k
-    excitation=np.ones(size);excitation[n:2*n]=0;excitation[fluid:]=0
+    excitation=np.ones(size);excitation[n:2*n]=0;excitation[4*n:6*n]=0;excitation[fluid:]=0
     eff=np.linalg.inv(M); load=M@excitation
     # 전체 손실계수를 바닥 관 길이에 비례해 분배한다. 형상별 실측 보정값은 아니다.
-    weights=.5*1000*d.area*d.loss*np.linalg.norm(ends-starts,axis=1)/d.B
+    weights=np.full(len(starts),.5*1000*d.area*d.loss)
     if d.separate_u:weights=np.full(len(starts),.5*1000*d.area*d.loss)
     clearance=u_dimensions(d)[4]-leg if d.separate_u else d.freeboard/up[0,2]
-    def resistance(v):
-        flow=T@v[fluid:]
-        return T.T@(weights*abs(flow)*flow)
     q=np.zeros(size);v=np.zeros(size)
     Q=np.full((len(t),size),np.nan);V=Q.copy();Q[0]=q;V[0]=v
     fmax=np.sqrt(np.linalg.eigvals(eff@K).real.max())
@@ -647,77 +694,7 @@ def simulate_space(b, d, t, ag, installed=True):
             or not np.all(np.isfinite(t)) or not np.all(np.isfinite(ag))
             or np.any(np.diff(t) <= 0)):
         raise ValueError('시간은 증가해야 하며 각 시간에 가속도 하나가 필요합니다.')
-    if b.masses or d.separate_u or (installed and d.shape!='U형'): return network_response(b,d,t,ag,installed)
-    theta = math.radians(d.angle)
-    co, si = math.cos(theta), math.sin(theta)
-    # 동일한 두 층 질량·층강성. 사용자가 설정한 값은 빈 건물의 1차 고유진동수다.
-    floor_mass=b.mass/2
-    omega=2*math.pi*b.frequency
-    story_k=floor_mass*omega**2*2/(3-math.sqrt(5))
-    story=np.array([[2.,-1.],[-1.,1.]])*story_k
-    # 좌표 0,1,2: 관 방향의 1층·지붕·물. 3,4: 고정질량 건물. 5,6: 빈 건물.
-    added_mass = d.mass+b.container_mass if installed else 0.
-    M=np.diag([floor_mass,floor_mass+added_mass,d.mass,
-               floor_mass,floor_mass+added_mass,floor_mass,floor_mass])
-    # 관 제거 시 부착 질량과 물의 반력을 동시에 제거한다.
-    M[1,2]=M[2,1]=1000*d.area*d.B if installed else 0.
-    K=np.zeros((7,7)); C=np.zeros_like(K)
-    for j in (0,3,5):
-        K[j:j+2,j:j+2]=story
-        C[j:j+2,j:j+2]=story*(2*b.damping/omega)
-    K[2,2]=2*1000*d.area*G
-    drag=.5*1000*d.area*d.loss
-    base=np.array([co,co,0.,1.,1.,1.,1.])
-    load=M@base
-    freq=math.sqrt(np.max(np.linalg.eigvals(np.linalg.solve(M,K)).real))
-    step_limit=min(.01,2*math.pi/(100*freq))
-    q=np.zeros(7);v=np.zeros(7)
-    Q=np.full((len(t),7),np.nan); V=Q.copy()
-    Q[0]=q; V[0]=v
-    previous=None;failure=None;n_valid=1
-    for i,span in enumerate(np.diff(t),1):
-        count=max(1,math.ceil(span/step_limit-1e-10))
-        dt=span/count;h=dt/2
-        if previous is None or abs(previous-h)>1e-13:
-            inv=np.linalg.inv(M+h*C+h*h*K)
-            vcoef=inv@M; qcoef=inv@(-h*K); forcing=inv@(-h*load)
-            loss=inv[:,2]*h*drag
-            previous=h
-        for j in range(count):
-            gm=ag[i-1]+(ag[i]-ag[i-1])*(j+.5)/count
-            free=vcoef@v+qcoef@q+forcing*gm
-            w=2*free[2]/(1+math.sqrt(1+4*loss[2]*abs(free[2])))
-            mid=free-loss*(abs(w)*w)
-            q=q+dt*mid;v=2*mid-v
-            if abs(q[2])>=d.limit:
-                failure=float(t[i-1]+(j+1)*dt);break
-        if failure is not None: break
-        Q[i]=q;V[i]=v;n_valid+=1
-    def world(values,j):
-        # 관에 직각인 축은 선형 고정 질량 건물의 응답을 투영한다.
-        return co*values[:,j]+si*si*values[:,j+3], si*(values[:,j]-co*values[:,j+3])
-    x,y=world(Q,1); vx,vy=world(V,1)
-    force=-Q@K.T-V@C.T
-    force[:,2]-=drag*np.abs(V[:,2])*V[:,2]
-    absolute=np.linalg.solve(M,force.T).T
-    ax,ay=world(absolute,1)
-    # 정지 출발. 샘플 사이에 선형인 입력 가속도를 구간별로 정확히 두 번 적분한다.
-    dt=np.diff(t)
-    vg=np.r_[0,np.cumsum(dt*(ag[:-1]+ag[1:])/2)]
-    ground=np.r_[0,np.cumsum(dt*vg[:-1]+dt**2*(2*ag[:-1]+ag[1:])/6)]
-    first=np.column_stack(world(Q,0))
-    roof=np.column_stack((x,y))
-    travel=max(np.nanmax(np.linalg.norm(roof[:n_valid],axis=1)),
-               np.nanmax(np.linalg.norm(first[:n_valid],axis=1)))+np.max(np.abs(ground[:n_valid]))
-    a1,al1=world(absolute,0)
-    return dict(t=t,ag=ag,ground=ground,first=first,travel=travel,installed=installed,
-                floors_x=np.column_stack([first[:,0],x]),floors_y=np.column_stack([first[:,1],y]),
-                floors_acc=np.column_stack([a1,ax]),floor_bare=Q[:,5:7],floor_bare_acc=absolute[:,5:7],
-                story_height=np.array([.21,.21]),mount=2,
-                state=np.column_stack((x,vx,Q[:,2],V[:,2],Q[:,6],V[:,6],Q[:,4],V[:,4])),
-                acc=np.column_stack((absolute[:,6],absolute[:,4],ax)),
-                lateral=np.column_stack((y,vy)),lateral_acc=ay,valid=failure is None,
-                failure_time=failure,n_valid=n_valid)
+    return network_response(b,d,t,ag,installed)
 
 
 def export_space(folder, b, d, r, title):
@@ -851,12 +828,16 @@ def lab(b,d,t,ag,title,out):
     count_row=ttk.Frame(floor_page);count_row.pack(fill='x')
     ttk.Label(count_row,text='건물 층수').pack(side='left')
     ttk.Spinbox(count_row,from_=1,to=100000,textvariable=count_var,width=6).pack(side='right')
-    for key,label,vals in [('m','층별 질량 (kg)',masses0),('k','층간 강성 (N/m)',ks0),('h','층 높이 (m)',hs0)]:
+    for key,label,vals in [('m','층별 질량 (kg)',masses0),('k','X 강성 (N/m)',ks0),('y','Y 강성 (N/m)',b.stories_y or ks0),('h','층 높이 (m)',hs0)]:
         row=ttk.Frame(floor_page);row.pack(fill='x',pady=2)
         ttk.Label(row,text=label).pack(side='left')
         v=tk.StringVar(value=', '.join(f'{x:.8g}' for x in vals))
         ttk.Entry(row,textvariable=v,width=19).pack(side='right')
         floor_fields[key]=v
+    damping_var=tk.StringVar(value=str(b.damping))
+    row=ttk.Frame(floor_page);row.pack(fill='x')
+    ttk.Label(row,text='감쇠비 (0.02 = 2%)').pack(side='left')
+    ttk.Entry(row,textvariable=damping_var,width=7).pack(side='right')
     mount_var=tk.StringVar(value=str(mount0))
     row=ttk.Frame(floor_page);row.pack(fill='x',pady=2)
     ttk.Label(row,text='관 설치 층').pack(side='left')
@@ -869,7 +850,7 @@ def lab(b,d,t,ag,title,out):
         var=tk.StringVar(value=f'{100*value:g}');size_vars.append(var)
         ttk.Entry(size_row,width=5,textvariable=var).pack(side='left')
     def three_floors():
-        for key,values in [('m',MASSES),('k',STIFFNESSES),('h',HEIGHTS)]:
+        for key,values in [('m',MASSES),('k',STIFFNESSES),('h',HEIGHTS),('y',STIFFNESSES)]:
             floor_fields[key].set(', '.join(map(str,values)))
         count_var.set(str(len(MASSES)))
         mount_var.set(str(INSTALL_FLOOR))
@@ -886,6 +867,9 @@ def lab(b,d,t,ag,title,out):
     kind_box.pack(fill='x')
     ttk.Label(quake_page,textvariable=wave_note,wraplength=245,foreground='#30566a').pack(anchor='w')
     kind_box.bind('<<ComboboxSelected>>',lambda _:wave_note.set(presets[kind_var.get()]))
+    hz_var=tk.StringVar(value='1')
+    ttk.Label(quake_page,text='단방향 진동수 (Hz)').pack(anchor='w')
+    ttk.Entry(quake_page,textvariable=hz_var,width=8).pack(anchor='w')
     original_wave=ag
     reference_peak=float(np.max(np.abs(ag))/G)
     src=Source(strength=reference_peak)
@@ -900,12 +884,20 @@ def lab(b,d,t,ag,title,out):
     fields={}
     for key,label,value in [('B','바닥 관 총길이 (cm)',d.B*100),('h','기준 U형 물 높이 (cm)',d.h*100),
               ('diameter','관 안지름 (cm)',d.diameter*100),('angle','설치 각도 (°)',d.angle),
-              ('loss','관의 손실계수',d.loss)]:
+              ('beta','오리피스 개구비 β',d.beta)]:
         row=ttk.Frame(pipe_page); row.pack(fill='x',pady=3)
         ttk.Label(row,text=label).pack(side='left')
         fields[key]=tk.StringVar(value=f'{value:g}')
         ttk.Entry(row,textvariable=fields[key],width=8).pack(side='right')
     ttk.Label(pipe_page,text='관 방향은 동쪽 0° · 북쪽 90°').pack(anchor='w',pady=4)
+    tune_ratio=tk.StringVar(value=f'{d.frequency/b.frequency:.8g}')
+    ratio_enabled=tk.BooleanVar(value=False)
+    ttk.Checkbutton(freq_page,text='조율비로 설정 (X 1차 모드 기준)',variable=ratio_enabled).pack(anchor='w')
+    ttk.Entry(freq_page,textvariable=tune_ratio,width=10).pack(anchor='w')
+    water_var=tk.StringVar(value=f'{d.mass:.9g}')
+    ttk.Label(pipe_page,text='총 물 질량 (kg)').pack(anchor='w')
+    ttk.Entry(pipe_page,textvariable=water_var,width=10).pack(anchor='w')
+    ttk.Label(pipe_page,text='오리피스 손실만 근사 · 분기관 경험식 적용 불확실',wraplength=250).pack(anchor='w')
     def preview_frequency(*_):
         if tune_mode.get(): return
         try:
@@ -995,6 +987,7 @@ def lab(b,d,t,ag,title,out):
     current[1]['building_spec']=b
     current[1]['source']=dict(src.input_for(ag,d.angle)[2],wave=default_kind)
     history=[]
+    zoom=[1.]
     camera=[math.radians(36),math.radians(25)]
     mesh_cache={}
     playback={'running':False,'start':0.,'busy':False}
@@ -1092,6 +1085,7 @@ def lab(b,d,t,ag,title,out):
             feet=network(dam)[0]
             top=H+max(feet[:,2]+u_dimensions(dam)[4])+dam.diameter
         scale=min(width*.65/(2.05*half),(height-62)/(top*cp+2*half*sp+.06))
+        scale*=zoom[0]
         P=np.array([[cy,sy*sp],[-sy,cy*sp],[0,-cp]])*max(1,scale)
         fixed=np.array([width*.35,26+(top*cp+half*sp)*scale])
         origin=fixed+np.array([gx,gy,0])@P
@@ -1298,7 +1292,7 @@ def lab(b,d,t,ag,title,out):
             summary.set(f"관 없음 · 기준 실험\n최대 지붕 변위  {1000*np.max(np.abs(r['state'][:,0])):.2f} mm\n최대 절대가속도  {np.max(np.abs(r['acc'][:,2]))/G:.3f} g")
         elif m:
             a,_,z=m['peak_displacement_m']
-            summary.set(f'최대 변위 · 지진 방향\n{a*1000:.2f} → {z*1000:.2f} mm\n\n장치 없음 대비 저감률\n변위  {pct(m["peak_reduction_vs_bare_pct"])}\n가속도  {pct(m["acceleration_reduction_vs_bare_pct"])}\n\n{dam.shape} · 물 {dam.mass:.3f} kg\n관 포함 {dam.mass+b.container_mass:.3f} kg')
+            summary.set(f'최대 변위 · 지진 방향\n{a*1000:.2f} → {z*1000:.2f} mm\n\n장치 없음 대비 저감률\n최대 변위  {pct(m["peak_reduction_vs_bare_pct"])}\nRMS 변위  {pct(m["rms_reduction_vs_bare_pct"])}\n가속도  {pct(m["acceleration_reduction_vs_bare_pct"])}\n\n{dam.shape} · 물 {dam.mass:.3f} kg\n관 포함 {dam.mass+b.container_mass:.3f} kg')
         else:
             summary.set(f'{r["failure_time"]:.2f}초에 수면 한계 도달\n여기까지 재생할 수 있어요.')
         scrub.configure(to=max(t[r['n_valid']-1],1e-12))
@@ -1372,15 +1366,23 @@ def lab(b,d,t,ag,title,out):
             actual=modes(np.diag(masses),diff.T@(np.array(ks)[:,None]*diff))[0][0]
             if not math.isclose(wb,2*np.pi*b.frequency,rel_tol=1e-7):
                 ks=tuple(k*(wb/actual)**2 for k in ks);actual=wb
-            target_b=replace(b,width=float(size_vars[0].get())/100,depth=float(size_vars[1].get())/100,mass=sum(masses),frequency=actual/(2*np.pi),masses=masses,stories=ks,heights=hs,mount=mount)
+            target_b=replace(b,stories_y=lists['y'],damping=float(damping_var.get()),width=float(size_vars[0].get())/100,depth=float(size_vars[1].get())/100,mass=sum(masses),frequency=actual/(2*np.pi),masses=masses,stories=ks,heights=hs,mount=mount)
+            mass=float(water_var.get())
+            if not np.isfinite(mass) or mass<=0:raise ValueError('물 질량은 양수여야 합니다.')
+            vals['h']=(mass/(1000*np.pi*vals['diameter']**2/4)-vals['B'])/2
+            if vals['h']<=0:raise ValueError('물이 바닥 관을 채우기에 부족합니다. B를 줄이거나 물 질량을 늘리세요.')
             bores,tops=leg_specs.get(shape_var.get(),((),()))
             vals.update(shape=shape_var.get(),tilt=float(tilt_var.get()),columns=int(column_var.get()),bores=bores,tops=tops)
+            if ratio_enabled.get():
+                ratio=float(tune_ratio.get())
+                if not np.isfinite(ratio) or ratio<=0:raise ValueError('조율비는 양수여야 합니다.')
+                omega_l.set(str(ratio*actual));tune_mode.set(True)
             if tune_mode.get():
                 wl=float(omega_l.get())
                 if not math.isfinite(wl) or wl<=0: raise ValueError('TLCD 각진동수는 양수여야 합니다.')
                 lo,hi=1e-7,max(1.,vals['h'])
                 def rate(height):
-                    trial=replace(d,**dict(vals,h=height))
+                    trial=replace(d,**dict(vals,h=height,tops=()))
                     validate(target_b,trial)
                     return 2*np.pi*trial.frequency
                 if rate(lo)<=wl: raise ValueError('이 관 길이에서 가능한 각진동수보다 큽니다.')
@@ -1392,12 +1394,23 @@ def lab(b,d,t,ag,title,out):
                     if rate(mid)>wl:lo=mid
                     else:hi=mid
                 vals['h']=(lo+hi)/2
+            if tune_mode.get():
+                scale=math.sqrt(mass/(1000*np.pi*vals['diameter']**2/4*(vals['B']+2*vals['h'])))
+                vals['diameter']*=scale
+                vals['bores']=tuple(None if x is None else x*scale for x in vals['bores'])
+                fields['diameter'].set(f"{vals['diameter']*100:.9g}")
             raw=replace(d,**vals); validate(target_b,raw)
             quake=Source(**{key:float(field.get()) for key,field in quake_fields.items()})
             kind=kind_var.get()
+            if kind=='단방향':
+                hz=float(hz_var.get())
+                if not np.isfinite(hz) or hz<=0:raise ValueError('진동수는 양수 Hz로 입력하세요.')
+                wave_cache[kind]=quake_wave(kind,hz)
             if kind not in wave_cache:wave_cache[kind]=quake_wave(kind)
             timeline,input_wave=wave_cache[kind]
             signal,relative,meta=quake.input_for(input_wave,raw.angle)
+            target_b=replace(target_b,bearing=meta['bearing_deg'])
+            meta['harmonic_hz']=float(hz_var.get()) if kind=='단방향' else None
             meta['wave']=kind
             dam=replace(raw,angle=relative,reverse=(raw.angle-meta['bearing_deg'])%360>=180)
             key=(quake,raw,target_b,enabled,kind)
@@ -1418,6 +1431,7 @@ def lab(b,d,t,ag,title,out):
             scene.delete('all');objects.clear();previous_paint.clear();mesh_cache.clear()
             fields['h'].set(f'{dam.h*100:.9g}')
             omega_l.set(f'{2*np.pi*dam.frequency:.9g}')
+            tune_ratio.set(f'{dam.frequency/b.frequency:.8g}')
             r['building_spec']=target_b
             cache[key]=r; r['source']=meta; current[:]=[dam,r]
             source.set(f"{kind}  ·  {count}층 / 관 {mount}층   ·   진원 거리 {meta['distance_km']:.1f} km   ·   건물 입력 {meta['site_pga_g']:.4f} g   ·   관과 진동 방향 {relative:.1f}°")
@@ -1433,6 +1447,64 @@ def lab(b,d,t,ag,title,out):
             dam,r=current
             run_title=source.get()
             task(lambda:export_space(folder,b,dam,r,run_title),lambda _:status.set(f'저장 완료\n{folder}'))
+    def optimize():
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        dam=current[0];model=b;times=t.copy();wave=ag.copy()
+        win=tk.Toplevel(root);win.title('최적 설계 탐색')
+        ttk.Label(win,text='각 행에 시작, 끝, 간격 입력 · B는 m · 동일 물 질량 / 최대 변위 증가 설계 제외').pack()
+        controls=ttk.Frame(win);controls.pack()
+        entries={}
+        for i,(key,text,default) in enumerate([('beta','개구비 β','.3,.5,.2'),('angle','각도 °','0,90,45'),('B','수평 길이 B (m)',f'{dam.B*.8:.6g},{dam.B*1.2:.6g},{dam.B*.4:.6g}')]):
+            ttk.Label(controls,text=text).grid(row=i,column=0)
+            v=tk.StringVar(value=default);entries[key]=v
+            ttk.Entry(controls,textvariable=v,width=25).grid(row=i,column=1)
+        feedback=tk.StringVar(value='기본 18개 조합 · 간격을 줄이면 정밀 탐색합니다.')
+        ttk.Label(win,textvariable=feedback).pack()
+        tree=ttk.Treeview(win,columns=('beta','angle','B','rms_pct','peak_pct'),show='headings',height=8)
+        for key,label in [('beta','개구비'),('angle','각도 °'),('B','B (m)'),('rms_pct','RMS 저감률 %'),('peak_pct','최대 저감률 %')]:
+            tree.heading(key,text=label);tree.column(key,width=120)
+        tree.pack(fill='x')
+        fig=Figure(figsize=(7,3),constrained_layout=True);canvas=FigureCanvasTkAgg(fig,master=win)
+        canvas.get_tk_widget().pack(fill='both',expand=True)
+        found=[]
+        def start():
+            try:
+                grids=[]
+                for key in ('beta','angle','B'):
+                    lo,hi,step=map(float,entries[key].get().split(','))
+                    if not all(np.isfinite([lo,hi,step])) or step<=0 or hi<lo:raise ValueError('범위와 간격을 확인하세요.')
+                    if key=='beta' and not 0<lo<=hi<=1:raise ValueError('개구비는 0 초과~1입니다.')
+                    if key=='angle' and not 0<=lo<=hi<=180:raise ValueError('각도는 0~180도입니다.')
+                    if key=='B' and lo<=0:raise ValueError('B는 양수입니다.')
+                    grids.append(np.arange(lo,hi+step*1e-8,step))
+                feedback.set(f'{np.prod([len(g) for g in grids])}개 계산 중')
+            except ValueError as error:feedback.set(str(error));return
+            def show(rows):
+                if not win.winfo_exists():return
+                found[:]=rows;tree.delete(*tree.get_children());fig.clear()
+                for row in rows[:30]:tree.insert('','end',values=[f'{row[k]:.5g}' for k in ('beta','angle','B','rms_pct','peak_pct')])
+                if not rows:feedback.set('제약조건을 만족한 설계 없음');canvas.draw_idle();return
+                best=rows[0]
+                feedback.set(f"최적 β={best['beta']:.4g}, 각도={best['angle']:g}°, B={best['B']:.4g} m · RMS {best['rms_pct']:+.3f}%, 최대 {best['peak_pct']:+.3f}%")
+                ax=fig.subplots()
+                xs=sorted(set(r['angle'] for r in rows));ys=sorted(set(r['B'] for r in rows))
+                values=np.full((len(ys),len(xs)),np.nan)
+                for row in rows:
+                    i,j=ys.index(row['B']),xs.index(row['angle'])
+                    if not np.isfinite(values[i,j]) or row['rms_pct']>values[i,j]:values[i,j]=row['rms_pct']
+                im=ax.imshow(values,aspect='auto',cmap='RdBu')
+                ax.set(xticks=range(len(xs)),xticklabels=xs,yticks=range(len(ys)),yticklabels=[f'{v:.3g}' for v in ys],xlabel='각도 °',ylabel='B (m)',title='각 칸에서 가장 좋은 개구비의 RMS 저감률')
+                fig.colorbar(im,ax=ax,label='%');canvas.draw_idle()
+            task(lambda:search_designs(model,dam,times,wave,*grids),show)
+        def save_search():
+            if not found:return
+            path=filedialog.asksaveasfilename(parent=win,defaultextension='.csv')
+            if path:
+                with open(path,'w',newline='',encoding='utf-8-sig') as f:
+                    writer=csv.DictWriter(f,fieldnames=found[0]);writer.writeheader();writer.writerows(found)
+        ttk.Button(controls,text='탐색 시작',command=start).grid(row=3,column=0)
+        ttk.Button(controls,text='결과 CSV 저장',command=save_search).grid(row=3,column=1)
     def compare():
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
         dam=current[0]
@@ -1443,7 +1515,9 @@ def lab(b,d,t,ag,title,out):
             canvas.get_tk_widget().pack(fill='both',expand=True)
             toolbar=NavigationToolbar2Tk(canvas,win);toolbar.update()
             canvas.draw_idle()
-        task(lambda:sweep(b,dam,t,ag),show)
+        def both():
+            return [sweep(b,dam,t,ag,metric=key) for key in ('peak_reduction_vs_bare_pct','rms_reduction_vs_bare_pct')]
+        task(both,lambda figures:[show(fig) for fig in figures])
     def angle_window():
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
         from matplotlib.figure import Figure
@@ -1467,8 +1541,8 @@ def lab(b,d,t,ag,title,out):
         fig = Figure(figsize=(8, 3.8), constrained_layout=True)
         axis = fig.subplots()
         plot = FigureCanvasTkAgg(fig, master=win)
-        table = ttk.Treeview(win, columns=('angle','peak','rate'), show='headings', height=5)
-        for key, label in [('angle','설치 각도'),('peak','최대 변위 (mm)'),('rate','장치 없음 대비 저감률')]:
+        table = ttk.Treeview(win, columns=('angle','peak','rate','rms'), show='headings', height=5)
+        for key, label in [('angle','설치 각도'),('peak','최대 변위 (mm)'),('rate','최대 변위 저감률'),('rms','RMS 변위 저감률')]:
             table.heading(key, text=label)
             table.column(key, width=145, anchor='center')
         memo = {}
@@ -1500,10 +1574,10 @@ def lab(b,d,t,ag,title,out):
                     axis.plot(times, result['state'][:,0]*1000, label=f'{angle:g}°', lw=1.5)
                     m = metrics(result)
                     if m is None:
-                        values = ('—', f"{result['failure_time']:.2f}초 수면 한계")
+                        values = ('—', '—', f"{result['failure_time']:.2f}초 수면 한계")
                     else:
                         rate = m['peak_reduction_vs_bare_pct']
-                        values = (f"{1000*m['peak_displacement_m'][2]:.2f}", '기준값 0' if rate is None else f'{rate:+.1f}%')
+                        values = (f"{1000*m['peak_displacement_m'][2]:.2f}", '기준값 0' if rate is None else f'{rate:+.1f}%', '기준값 0' if m['rms_reduction_vs_bare_pct'] is None else f"{m['rms_reduction_vs_bare_pct']:+.2f}%")
                     table.insert('', 'end', values=(f'{angle:g}°', *values))
                 table.configure(height=len(angles))
                 axis.set(xlabel='시간 (초)', ylabel='지진 방향 지붕 변위 (mm)', xlim=(times[0],times[-1]))
@@ -1528,7 +1602,7 @@ def lab(b,d,t,ag,title,out):
         m=r['source']
         name=(f"실험 {len(history)+1}  |  ω 건물 {2*math.pi*b.frequency:.2f} / 물 {2*math.pi*dam.frequency:.2f} rad/s  |  진원 ({m['east']:g}, {m['north']:g}, 깊이 {m['depth']:g}) km"
               f"  ·  기준 {m['strength']:g} g  ·  관 {m['heading_deg']:g}°"
-              f"  ·  길이/물높이/지름 {dam.B*100:g}/{dam.h*100:g}/{dam.diameter*100:g} cm  ·  손실 {dam.loss:g}")
+              f"  ·  길이/물높이/지름 {dam.B*100:g}/{dam.h*100:g}/{dam.diameter*100:g} cm  ·  개구비 {dam.beta:g}")
         mode=dam.shape if r.get('installed',True) else '관 없음'
         if mode=='관 없음': name=f"실험 {len(history)+1} | 진원 ({m['east']:g}, {m['north']:g}, 깊이 {m['depth']:g}) km · 기준 {m['strength']:g} g · 건물 {2*math.pi*b.frequency:.2f} rad/s"
         if dam.shape=='다기둥형':mode+=f' {dam.columns}기둥'
@@ -1662,8 +1736,8 @@ def lab(b,d,t,ag,title,out):
             '모양 선택만 바꾸면 물 총부피와 빈 관 질량이 유지됩니다. 바닥 총길이 B를 가지에 나누고, 기준 U형 물 높이 h의 두 배를 모든 다리에 나눕니다. V형은 수평 기준 경사각이며 피자 거치대는 120도 간격 3개, 다기둥형은 일렬 2~24개입니다. 독립 U관 3개는 같은 설치 층에 고정되며 관마다 좌우 물 부피 변화가 상쇄됩니다. 기둥 안지름을 바꾸면 물의 양을 유지하도록 정지 수면을 다시 계산합니다. 그림의 차단판 효과는 손실계수로 근사합니다.\n\n'
             '진원 좌표는 건물을 기준으로 입력합니다. 가상 지진은 진원에서 건물로 향하는 수평선 방향으로 흔들린다고 가정합니다. 바로 아래 진원은 동쪽을 기준으로 사용합니다.\n\n'
             '세기는 진원 거리 10 km에서의 최대 가속도(g)입니다. 같은 파형에 거리 계수 √101 / √(거리²+1)을 곱합니다(거리 단위 km). 모든 기록은 진동 도착 시점부터 비교합니다. 실제 지반, 지진 규모, 파의 도착시간은 계산 범위 밖입니다.\n\n'
-            '물은 관을 따라 움직이는 한 물기둥으로 계산합니다. 물의 관성, 두 수면 높이 차에 따른 중력, 유속의 제곱에 비례하는 저항이 들어갑니다. 3D 화면은 이 계산값을 보여줍니다.')
-    for label,cmd in [('조건 적용',calculate),('현재 실험 담기',remember),('실험 그래프 비교',history_window),('각도별 그래프 비교',angle_window),('형상 × 각도 비교',compare),('결과 저장',save),('물과 지진 계산 원리',model_info)]:
+            '오리피스 개구비 경험식만 적용하며 관벽 마찰·곡관 손실은 생략합니다. 분기관과 비대칭 관에서 경험식 적용 범위는 검증되지 않았습니다.\n\n물은 관을 따라 움직이는 한 물기둥으로 계산합니다. 물의 관성, 두 수면 높이 차에 따른 중력, 유속의 제곱에 비례하는 저항이 들어갑니다. 3D 화면은 이 계산값을 보여줍니다.')
+    for label,cmd in [('조건 적용',calculate),('최적 설계 탐색',optimize),('현재 실험 담기',remember),('실험 그래프 비교',history_window),('각도별 그래프 비교',angle_window),('형상 × 각도 비교',compare),('결과 저장',save),('물과 지진 계산 원리',model_info)]:
         ttk.Button(panel,text=label,command=cmd).pack(fill='x',pady=3)
     ttk.Separator(panel).pack(fill='x',pady=12)
     ttk.Label(panel,textvariable=summary,justify='left').pack(anchor='w')
@@ -1682,6 +1756,10 @@ def lab(b,d,t,ag,title,out):
         draw_scene()
     scene.bind('<ButtonPress-1>',lambda e:drag_start.__setitem__(slice(None),[e.x,e.y]))
     scene.bind('<B1-Motion>',orbit)
+    def zoom_view(event):
+        zoom[0]=np.clip(zoom[0]*(1.12 if event.delta>0 else 1/1.12),.25,5.)
+        draw_scene()
+    scene.bind('<MouseWheel>',zoom_view)
     scene.bind('<Configure>',draw_scene);chart.bind('<Configure>',draw_chart)
     chooser.bind('<<ComboboxSelected>>',draw_chart)
     floor_selector.bind('<<ComboboxSelected>>',draw_chart)
@@ -1747,12 +1825,12 @@ def designs(omega, install=INSTALL_FLOOR, locations=FLOORS):
         if not isinstance(floor, (int,np.integer)) or not 1 <= floor <= N:
             raise ValueError(f'{code}: 설치 층은 1~{N} 사이의 정수여야 합니다.')
         p = dict(inputs)
-        for key in ['L','B','A','Ao','rho']:
+        for key in ['L','B','A','rho']:
             positive(f'{code}: {key}',p[key])
-        if p['B'] >= p['L'] or p['Ao'] > p['A']:
+        if p['B'] >= p['L'] or not 0<p['beta']<=1:
             raise ValueError(f'{code}: B < L, Ao ≤ A여야 합니다.')
-        if not np.isfinite(p['sigma']) or p['sigma'] < 0:
-            raise ValueError(f'{code}: 손실계수는 유한하고 0 이상이어야 합니다.')
+        p['Ao']=p['A']*p['beta']
+        p['xi']=orifice_loss(p['beta'])
         return dict(p,code=code,floor=int(floor),mf=p['rho']*p['A']*p['L'],
                     alpha=p['B']/p['L'],kf=2*p['rho']*G*p['A'],wf=math.sqrt(2*G/p['L']))
     ref = make('REF', install, REFERENCE)
@@ -1761,15 +1839,15 @@ def designs(omega, install=INSTALL_FLOOR, locations=FLOORS):
     def area(L):
         positive('액체 길이',L)
         return ref['mf']/(CUSTOM_DENSITY*L) if KEEP_WATER_MASS else CUSTOM_AREA
-    for idx,(j,L,B,Ao,sigma) in enumerate(itertools.product(locations,L_VALUES,B_VALUES,AO_VALUES,SIGMA_VALUES),1):
-        result.append(make(f'D{idx:02d}',j,dict(L=L,B=B,A=area(L),Ao=Ao,sigma=sigma,rho=CUSTOM_DENSITY)))
+    for idx,(j,L,B,beta) in enumerate(itertools.product(locations,L_VALUES,B_VALUES,BETA_VALUES),1):
+        result.append(make(f'D{idx:02d}',j,dict(L=L,B=B,A=area(L),beta=beta,rho=CUSTOM_DENSITY)))
     for mode in TUNE_TO_MODES:
         if not isinstance(mode,int) or not 1 <= mode <= N:
             raise ValueError(f'조율 대상 모드 번호는 1~{N}입니다.')
         L = 2*G/omega[mode-1]**2
         for j in dict.fromkeys(locations):
             result.append(make(f'M{mode}F{j}',j,dict(L=L,B=ref['alpha']*L,A=area(L),
-                Ao=area(L)*ref['Ao']/ref['A'],rho=CUSTOM_DENSITY,sigma=ref['sigma'])))
+                beta=ref['beta'],rho=CUSTOM_DENSITY)))
     return result
 
 
@@ -1790,8 +1868,8 @@ def system(M,K,C,p):
     # 통째로 지면과 이동할 때 관 내부의 상대 변위는 0. 하중은 -Mc@[1,...,1,0]*ag.
     # 마지막 성분에도 -alpha*mf*ag가 들어간다.
     influence=np.r_[np.ones(n),0.]
-    # 손실력 단위 N. sigma는 관 평균 속도 y'와 Ao를 사용한 무차원 계수.
-    drag=.5*p['rho']*p['Ao']*p['sigma']
+    # 관 평균 유속 기준 오리피스 손실만 고려. beta는 무차원 면적 개구비.
+    drag=.5*p['rho']*p['A']*orifice_loss(p['beta'])
     return Mc,Kc,Cc,influence,drag
 
 
@@ -2062,7 +2140,7 @@ def graphs(t,model,phi,omega,cases,results,rows,freq_rows):
         cmap=plt.get_cmap('RdBu').copy();cmap.set_bad('#dddddd')
         im=ax.imshow(matrix,aspect='auto',cmap=cmap,vmin=-limit,vmax=limit)
         ax.set(xticks=range(N),xticklabels=floors,xlabel='응답을 측정한 층',yticks=range(len(group)),
-               yticklabels=[f"{p['code']} · {p['floor']}층 L={p['L']:.3g} B={p['B']:.3g} Ao={p['Ao']:.3g} σ={p['sigma']:g}" for p in group],
+               yticklabels=[f"{p['code']} · {p['floor']}층 L={p['L']:.3g} B={p['B']:.3g} β={p['beta']:g}" for p in group],
                title='설치 위치·설계별 가속도 RMS 감소율 (%) · 음수는 증가 / 회색은 산출 불가')
         fig.colorbar(im,ax=ax)
         save(fig,f'designs_{start+1}')
@@ -2271,3 +2349,5 @@ def main():
 
 if __name__=='__main__':
     main()
+
+
