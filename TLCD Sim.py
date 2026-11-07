@@ -395,8 +395,14 @@ def draw_geometry(ax, d):
             lw=12, color='#cbd5e1', solid_capstyle='butt')
     ax.plot([-d.B/2, -d.B/2, d.B/2, d.B/2], [d.h, 0, 0, d.h],
             lw=6, color='#0284c7', solid_capstyle='butt')
+    ax.plot([-d.B/2,d.B/2],[0,0],color='#111827',ls='--',lw=1)
+    ax.annotate('',xy=(d.B/2,-.04),xytext=(-d.B/2,-.04),arrowprops=dict(arrowstyle='<->',color='#111827'))
+    ax.text(0,-.045,f'B = {d.B*100:.3f} cm',ha='center',va='top',fontsize=8)
+    xh=d.B/2+.045
+    ax.annotate('',xy=(xh,d.h),xytext=(xh,0),arrowprops=dict(arrowstyle='<->',color='#111827'))
+    ax.text(xh+.005,d.h/2,f'h = {d.h*100:.3f} cm',va='center',fontsize=8)
     ax.axhline(d.h, color='#0284c7', ls=':', lw=1)
-    ax.text(0, top, f'B={d.B:.2f} m | h={d.h:.2f} m\n안지름={1000*d.diameter:.0f} mm', ha='center', va='bottom', fontsize=9)
+    ax.text(0, top, f'B={d.B:.2f} m | h={d.h:.2f} m\nD_i={1000*d.diameter:.2f} mm | L=B+2h={d.length:.5f} m', ha='center', va='bottom', fontsize=9)
     ax.set(xlim=(-d.B/2-0.12, d.B/2+0.12), ylim=(-0.06, top+0.13),
            title='U자 관 측면 · 파란색 = 정지 상태의 물', xlabel='수평 거리 [m]', ylabel='높이 [m]')
     ax.set_aspect('equal', adjustable='box')
@@ -637,9 +643,9 @@ def network_response(b,d,t,ag,installed=True):
     n=len(masses); fluid=6*n; size=fluid+modes
     added=d.mass+b.container_mass if installed else 0.
     M=np.eye(size);K=np.zeros_like(M);C=K.copy()
-    omega=2*np.pi*b.frequency
     difference=np.eye(n)-np.eye(n,k=-1)
     story=difference.T@(stiffness[:,None]*difference)
+    omega=float(np.sqrt(np.linalg.eigvalsh(story/np.sqrt(masses[:,None]*masses[None,:]))[0]))
     for j,extra in ((0,added),(n,added),(2*n,0),(3*n,added)):
         M[j:j+n,j:j+n]=np.diag(masses)
         M[j+mount-1,j+mount-1]+=extra
@@ -665,14 +671,14 @@ def network_response(b,d,t,ag,installed=True):
     M[fluid:,fluid:]=fluid_mass;K[fluid:,fluid:]=fluid_k
     excitation=np.ones(size);excitation[n:2*n]=0;excitation[4*n:6*n]=0;excitation[fluid:]=0
     eff=np.linalg.inv(M); load=M@excitation
-    # 전체 손실계수를 바닥 관 길이에 비례해 분배한다. 형상별 실측 보정값은 아니다.
+    # 각 바닥 유로 평균속도에 동일한 개구비 경험식을 적용한다. 분기관 실측 보정은 미포함.
     weights=np.full(len(starts),.5*1000*d.area*d.loss)
-    if d.separate_u:weights=np.full(len(starts),.5*1000*d.area*d.loss)
+    flow_eye=np.eye(len(starts))
     clearance=u_dimensions(d)[4]-leg if d.separate_u else d.freeboard/up[0,2]
     # 일반 원형 U관의 보수적인 전단면 충수 적용 경계.
     # 수평 관 중심선 z=0, 내측 천장 z=D/2. 접합부/자유수면의 3차원 형상은 미해석.
     # 이는 공기 유입을 확정하는 실험식이 아니라 고전 물기둥 모델의 적용 제한이다.
-    standard_u=d.shape=='U형' and not d.separate_u
+    standard_u=installed and d.shape=='U형' and not d.separate_u
     lower_rise=np.broadcast_to(-np.asarray(leg),S.shape[0]).copy()
     if standard_u:lower_rise+=d.diameter/2
     q=np.zeros(size);v=np.zeros(size)
@@ -701,13 +707,13 @@ def network_response(b,d,t,ag,installed=True):
             for _ in range(20):
                 residual=flow+transfer@(weights*abs(flow)*flow)-rhs
                 if max(abs(residual))<1e-11*(1+max(abs(rhs))):break
-                flow-=np.linalg.solve(np.eye(len(flow))+transfer*(2*weights*abs(flow)),residual)
+                flow-=np.linalg.solve(flow_eye+transfer*(2*weights*abs(flow)),residual)
             else:raise ValueError('유체 저항 계산이 수렴하지 않았습니다. 입력 조건을 확인하세요.')
             mid=free-drag@(T.T@(weights*abs(flow)*flow))
-            old_q=q.copy();old_v=v.copy()
+            old_q=q;old_v=v
             q=q+dt*mid;v=2*mid-v
             rise=S@q[fluid:]
-            if np.any(rise<=lower_rise) or np.any(rise>=clearance):
+            if installed and (np.any(rise<=lower_rise) or np.any(rise>=clearance)):
                 old_rise=S@old_q[fluid:]
                 lower=lower_rise
                 upper=np.broadcast_to(np.asarray(clearance),rise.shape)
@@ -722,8 +728,15 @@ def network_response(b,d,t,ag,installed=True):
                 failure=t[i-1]+(j+fraction)*dt
                 failure_kind=('모델 적용 범위 초과' if standard_u else '수면 하한 도달') if is_lower else '수면 상한 도달'
                 failure_detail=f'{column+1}번 기둥 · {failure:.6f}초 (내부 단계 보간) · {failure_kind}'+(' · 수평관 천장에 수면 도달, 공기 유입 가능. 이후 부분 충수 모델 미검증.' if standard_u and is_lower else '')
-                ag[i]=ag[i-1]+(ag[i]-ag[i-1])*(failure-t[i-1])/span
-                t[i]=failure;Q[i]=q;V[i]=v;nvalid=i+1
+                # 원래 기록의 표본을 지우지 않고 경계 시각을 추가한다.
+                # 모든 설계는 동일한 원본 가진의 선형 보간을 받는다.
+                if failure<t[i]-1e-12:
+                    value=float(np.interp(failure,t,ag))
+                    t=np.insert(t,i,failure);ag=np.insert(ag,i,value)
+                    Q=np.insert(Q,i,q,axis=0);V=np.insert(V,i,v,axis=0)
+                else:
+                    Q[i]=q;V[i]=v
+                nvalid=i+1
                 break
         if failure is not None:break
         Q[i]=q;V[i]=v;nvalid+=1
@@ -732,18 +745,24 @@ def network_response(b,d,t,ag,installed=True):
         mb=M[np.ix_(indices,indices)];kb=K[np.ix_(indices,indices)];cb=C[np.ix_(indices,indices)]
         qb=np.zeros(2*n);vb=qb.copy();influence=np.r_[np.ones(n),np.zeros(n)]
         Q[0,indices]=qb;V[0,indices]=vb
+        last_dt=None
         for i,span in enumerate(np.diff(t),1):
             steps=max(1,int(np.ceil(span/stepmax)));dt=span/steps;half=dt/2
-            invb=np.linalg.inv(mb+half*cb+half*half*kb)
+            if last_dt is None or abs(dt-last_dt)>1e-13:
+                invb=np.linalg.inv(mb+half*cb+half*half*kb)
+                bm=invb@mb;bk=-half*invb@kb
+                bg=-half*bm@influence
+                last_dt=dt
             for j in range(steps):
                 gm=ag[i-1]+(ag[i]-ag[i-1])*(j+.5)/steps
-                midpoint=invb@(mb@vb-half*kb@qb-half*mb@influence*gm)
+                midpoint=bm@vb+bk@qb+bg*gm
                 qb+=dt*midpoint;vb=2*midpoint-vb
             Q[i,indices]=qb;V[i,indices]=vb
     force=-np.nan_to_num(Q)@K.T-np.nan_to_num(V)@C.T
     currents=np.nan_to_num(V[:,fluid:])@T.T
     force[:,fluid:]-=(weights*abs(currents)*currents)@T
     acc=force@eff.T
+    acc[nvalid:,:2*n]=np.nan
     heights=(Q[:,fluid:]@S.T)*up[:,2]
     speeds=(V[:,fluid:]@S.T)*up[:,2]
     dt=np.diff(t);vg=np.r_[0,np.cumsum(dt*(ag[:-1]+ag[1:])/2)]
@@ -752,6 +771,7 @@ def network_response(b,d,t,ag,installed=True):
     travel=np.nanmax(np.hypot(floors_x[:nvalid],floors_y[:nvalid]))+max(abs(ground[:nvalid]))
     roof=n-1;bare=3*n-1;fixed=4*n-1
     return dict(t=t,ag=ag,ground=ground,first=Q[:,[0,n]],travel=travel,installed=installed,
+        integration_max_step_s=stepmax,
         floors_x=floors_x,floors_y=floors_y,floors_acc=acc[:,:n],floor_bare=Q[:,2*n:3*n],
         floor_bare_acc=acc[:,2*n:3*n],story_height=story_height,mount=mount,
         lower_water=lower_rise*up[:,2],upper_water=np.broadcast_to(clearance,len(up))*up[:,2],
@@ -828,6 +848,21 @@ class Source:
         signal = waveform*(pga*G/peak) if peak else np.zeros_like(waveform)
         return signal, (heading-bearing)%180, dict(**asdict(self),distance_km=distance,
             bearing_deg=bearing,heading_deg=heading,site_pga_g=pga)
+
+
+def read_settings(path):
+    """설정 데이터는 실행 파일과 별도로 보존한다."""
+    if not path.exists():return dict(version=1,profiles={},last=None)
+    data=json.loads(path.read_text(encoding='utf-8'))
+    if data.get('version')!=1 or not isinstance(data.get('profiles'),dict):
+        raise ValueError('지원하지 않는 설정 파일 형식입니다.')
+    return data
+
+def write_settings(path,data):
+    path.parent.mkdir(parents=True,exist_ok=True)
+    temporary=path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(data,ensure_ascii=False,indent=2,allow_nan=False),encoding='utf-8')
+    temporary.replace(path)
 
 
 def lab(b,d,t,ag,title,out):
@@ -974,11 +1009,23 @@ def lab(b,d,t,ag,title,out):
     ttk.Label(quake_page,text='건물 위치 (0, 0) · 음수는 서쪽/남쪽\n세기 = 기준 거리의 최대 지면 가속도').pack(anchor='w')
     pipe_on=tk.BooleanVar(root,True)
     fields={}
-    for key,label,value in [('B','바닥 관 총길이 (cm)',d.B*100),('h','기준 U형 물 높이 (cm)',d.h*100),
-              ('diameter','관 안지름 (cm)',d.diameter*100),('angle','설치 각도 (°)',d.angle),
+    dimension_labels={}
+    def update_dimension_labels():
+        shape=shape_var.get()
+        meanings={'U형':'바닥 수평관 중심선 간 거리 B (cm)',
+            'V형':'양쪽 경사관 하단 중심 간 거리 B (cm)',
+            '피자 거치대':'바닥 세 가지 중심선 길이 합 B (cm)',
+            '다기둥형':'첫·마지막 기둥 중심선 간 거리 B (cm)',
+            '독립 U관 3개':'세 U관의 수평 중심선 거리 합 B (cm)'}
+        if 'B' in dimension_labels:dimension_labels['B'].set(meanings[shape])
+        if 'h' in dimension_labels:dimension_labels['h'].set('수평관 중심선에서 정지 수면까지 h (cm)' if shape=='U형' else '기준 U형의 h · 물 총량 설정 기준 (cm)')
+
+    for key,label,value in [('B','바닥 수평관 중심선 간 거리 B (cm)',d.B*100),('h','수평관 중심선에서 정지 수면까지 h (cm)',d.h*100),
+              ('diameter','관 안지름 D_i (cm)',d.diameter*100),('angle','설치 각도 (°)',d.angle),
               ('beta','오리피스 개구비 β',d.beta)]:
         row=ttk.Frame(pipe_page); row.pack(fill='x',pady=3)
-        ttk.Label(row,text=label).pack(side='left')
+        dimension_labels[key]=tk.StringVar(value=label)
+        ttk.Label(row,textvariable=dimension_labels[key]).pack(side='left')
         fields[key]=tk.StringVar(value=f'{value:g}')
         ttk.Entry(row,textvariable=fields[key],width=8).pack(side='right')
     ttk.Label(pipe_page,text='관 방향은 동쪽 0° · 북쪽 90°').pack(anchor='w',pady=4)
@@ -999,7 +1046,9 @@ def lab(b,d,t,ag,title,out):
             omega_l.set(f'{2*np.pi*trial.frequency:.9g}' if min(trial.B,trial.h,trial.tilt)>0 else '')
         except (ValueError,ZeroDivisionError): omega_l.set('')
     for key in ('B','h'): fields[key].trace_add('write',preview_frequency)
+    update_dimension_labels()
     def change_shape(_):
+        update_dimension_labels()
         # 모양 전환은 마지막으로 적용한 물의 양을 기준으로 한다.
         previous=current[0]
         for key in ('B','h','diameter'):
@@ -1317,6 +1366,34 @@ def lab(b,d,t,ag,title,out):
         paint('section','text',(mx,surface-12),text='동서 단면 · 빨간 점은 진원',fill='#304c5c')
         paint('depth','text',(mx,sz+15),text=f"깊이 {meta['depth']:g} km",fill='#913a34')
         paint('header','text',(12,10),text=(f"{r['mount']}층 관 설치" if r.get('installed',True) else '관 없음')+'   /   드래그로 시점 회전',anchor='nw',fill='#233d50')
+        for obj in list(objects):
+            if isinstance(obj[0],tuple) and obj[0][0]=='dimension':
+                scene.delete(objects.pop(obj));previous_paint.pop(obj,None)
+        if r.get('installed',True) and dam.shape=='U형' and not dam.separate_u:
+            ca,sa=np.cos(angle),np.sin(angle)
+            base_z=attach_z+dam.diameter/2
+            def dimension_point(u,z):
+                return np.array([dx+u*ca,dy+u*sa,base_z+z])@P+origin
+            def dimension_line(tag,points,**style):
+                paint(('dimension',tag),'line',np.array(points).ravel().tolist(),**style)
+            def dimension_text(tag,point,text):
+                paint(('dimension',tag),'text',tuple(point),text=text,fill='#172d42',anchor='w',font=('Malgun Gothic',9))
+            left=dimension_point(-dam.B/2,0);right=dimension_point(dam.B/2,0)
+            dimension_line('center',[left,right],fill='#172d42',dash=(5,3),width=2)
+            # B endpoints stay on the projected vertical centerlines, offset only on screen.
+            offset=np.array([0,22])
+            dimension_line('B',[left+offset,right+offset],fill='#172d42',arrow='both',width=1)
+            dimension_line('Bl',[left,left+offset],fill='#718392',dash=(2,3))
+            dimension_line('Br',[right,right+offset],fill='#718392',dash=(2,3))
+            dimension_text('Blabel',(left+right)/2+offset+[0,12],f'B {dam.B*100:.3f} cm')
+            rest=dimension_point(dam.B/2,dam.h)
+            dimension_line('rest',[dimension_point(-dam.B/2,dam.h),rest],fill='#477b9b',dash=(2,4))
+            hoffset=np.array([30,0])
+            dimension_line('h',[right+hoffset,rest+hoffset],fill='#172d42',arrow='both',width=1)
+            dimension_line('h0',[right,right+hoffset],fill='#718392',dash=(2,3))
+            dimension_line('h1',[rest,rest+hoffset],fill='#718392',dash=(2,3))
+            dimension_text('hlabel',(right+rest)/2+hoffset+[4,0],f'h {dam.h*100:.3f} cm')
+            dimension_text('formula',np.array([14,46]),f'정지 기준 · L = B + 2h = {dam.length*100:.3f} cm · D_i = {dam.diameter*100:.3f} cm')
         paint('readout','text',(12,height-8),text=f'{t[j]:.2f} 초   |   지면 {ground*1000:+.1f} mm   ·   지면 대비 지붕 {x*1000:+.1f} mm',anchor='sw',fill='#314b5a')
         clock.set(f'{t[j]:.2f} 초')
         chart.delete('cursor')
@@ -1521,7 +1598,7 @@ def lab(b,d,t,ag,title,out):
             meta['harmonic_hz']=float(hz_var.get()) if kind=='단방향' else None
             meta['wave']=kind
             dam=replace(raw,angle=relative,reverse=(raw.angle-meta['bearing_deg'])%360>=180)
-            key=(quake,raw,target_b,enabled,kind)
+            key=(quake,raw,target_b,enabled,kind,float(hz_var.get()) if kind=="단방향" else None)
         except ValueError as error:
             pipe_on.set(current[1].get('installed',True))
             messagebox.showerror('입력 확인',str(error)); return
@@ -1529,7 +1606,7 @@ def lab(b,d,t,ag,title,out):
             if len(cache)>=6: cache.clear()
             nonlocal ag,b,t
             t=r["t"]
-            ag=signal
+            ag=r["ag"]
             b=target_b
             omega_b.set(f'{2*np.pi*b.frequency:.9g}')
             count_var.set(str(count))
@@ -1548,6 +1625,7 @@ def lab(b,d,t,ag,title,out):
             r['building_summary']=model_info
             refresh()
             position.set(min(previous_time,t[r['n_valid']-1]));draw_scene()
+            persist_last()
             status.set(r.get('failure_detail') or ('주의 · 정지 물높이 1 cm 미만' if dam.h<.01 else '계산 완료 · 비교 목록에 담을 수 있어요.'))
         task(lambda:cache[key] if key in cache else simulate_space(target_b,dam,timeline,signal,enabled),done)
     def save():
@@ -1704,9 +1782,9 @@ def lab(b,d,t,ag,title,out):
                 table.delete(*table.get_children())
                 axis.clear()
                 reference = max(results.values(), key=lambda r: r['n_valid'])
-                axis.plot(times, reference['state'][:,4]*1000, '--', color='#56616b', label='장치 없음', lw=1.1)
+                axis.plot(reference['t'], reference['state'][:,4]*1000, '--', color='#56616b', label='장치 없음', lw=1.1)
                 for angle, result in results.items():
-                    axis.plot(times, result['state'][:,0]*1000, label=f'{angle:g}°', lw=1.5)
+                    axis.plot(result['t'], result['state'][:,0]*1000, label=f'{angle:g}°', lw=1.5)
                     m = metrics(result)
                     if m is None:
                         values = ('—', '—', f"{result['failure_time']:.2f}초 수면 한계")
@@ -1919,6 +1997,86 @@ def lab(b,d,t,ag,title,out):
     chooser.bind('<<ComboboxSelected>>',draw_chart)
     floor_selector.bind('<<ComboboxSelected>>',draw_chart)
     pause();refresh();status.set('기본 실험 준비 완료 · ▶ 재생')
+    # 입력 문자열과 보조 설정까지 저장하여 다시 열었을 때 같은 조건을 복원한다.
+    script=globals().get('__file__')
+    settings_path=(Path(script).resolve().parent if script else Path.cwd())/'TLCD_settings.json'
+    try:
+        saved=read_settings(settings_path)
+    except (OSError,ValueError,TypeError) as error:
+        saved=dict(version=1,profiles={},last=None)
+        messagebox.showwarning('설정 읽기',f'기존 설정을 읽지 못했습니다. 파일을 확인하세요.\n{error}')
+    variable_groups={'pipe':fields,'floor':floor_fields,'source':quake_fields}
+    variables=dict(shape=shape_var,tilt=tilt_var,columns=column_var,count=count_var,mount=mount_var,
+        damping=damping_var,width=size_vars[0],depth=size_vars[1],size_link=size_link,
+        stiffness_mode=stiffness_mode,water_mass=water_var,wave=kind_var,hz=hz_var,
+        omega_b=omega_b,omega_l=omega_l,tune=tune_mode,ratio=tune_ratio,
+        ratio_enabled=ratio_enabled,pipe_on=pipe_on)
+    def snapshot():
+        data=dict(values={k:v.get() for k,v in variables.items()},
+            groups={name:{k:v.get() for k,v in group.items()} for name,group in variable_groups.items()},
+            legs=leg_specs,reference_size=[reference_size[0],reference_size[1],reference_size[2].tolist()])
+        if kind_var.get() not in QUAKE_NOTES:
+            time_input,acc_input=wave_cache[kind_var.get()]
+            data['custom_wave']=[time_input.tolist(),acc_input.tolist()]
+        return data
+    def persist_last():
+        saved['last']=snapshot()
+        try:write_settings(settings_path,saved)
+        except (OSError,ValueError) as error:
+            messagebox.showwarning('설정 저장',f'자동 저장하지 못했습니다.\n{error}')
+    def restore(data):
+        nonlocal reference_size
+        if playback['busy']:
+            messagebox.showinfo('설정','계산이 끝난 뒤 불러오세요.');return
+        try:
+            values=data['values'];groups=data['groups']
+            reference=data['reference_size']
+            restored_reference=(float(reference[0]),float(reference[1]),np.array(reference[2],float))
+            if 'custom_wave' in data:
+                wave_cache[values['wave']]=tuple(np.array(x,float) for x in data['custom_wave'])
+                presets[values['wave']]='저장한 사용자 입력 기록입니다.'
+                kind_box.configure(values=list(presets))
+            for key,value in values.items():
+                if key in variables:variables[key].set(value)
+            for name,group in groups.items():
+                for key,value in group.items():
+                    if name in variable_groups and key in variable_groups[name]:variable_groups[name][key].set(value)
+            leg_specs.clear()
+            leg_specs.update({k:tuple(tuple(x) for x in pair) for k,pair in data['legs'].items()})
+            reference_size=restored_reference
+            wave_note.set(presets[kind_var.get()])
+            update_dimension_labels();switch_tune()
+            calculate()
+        except (KeyError,TypeError,ValueError) as error:
+            messagebox.showerror('설정 불러오기',f'설정 내용을 확인하세요.\n{error}')
+    def save_named():
+        from tkinter import simpledialog
+        if playback['busy']:
+            messagebox.showinfo('설정','계산이 끝난 뒤 저장하세요.');return
+        name=simpledialog.askstring('설정 저장','설정 이름을 입력하세요.',parent=root)
+        if not name or not name.strip():return
+        name=name.strip()
+        if name in saved['profiles'] and not messagebox.askyesno('설정 저장',f'“{name}” 설정을 덮어쓸까요?'):return
+        saved['profiles'][name]=snapshot()
+        try:write_settings(settings_path,saved)
+        except (OSError,ValueError) as error:messagebox.showerror('설정 저장',str(error));return
+        status.set(f'설정 저장 완료 · {name}')
+    def load_named():
+        window=tk.Toplevel(root);window.title('저장한 설정')
+        names=list(saved['profiles'])
+        picker=ttk.Combobox(window,values=names,state='readonly',width=40);picker.pack(padx=15,pady=12)
+        if names:picker.current(0)
+        def load():
+            if picker.get() not in saved['profiles']:return
+            data=saved['profiles'][picker.get()]
+            window.destroy();restore(data)
+        ttk.Button(window,text='불러오기',command=load).pack(pady=8)
+        ttk.Label(window,text='불러온 설정은 자동으로 조건 적용됩니다.').pack(padx=12,pady=8)
+    menu=tk.Menu(root);settings_menu=tk.Menu(menu,tearoff=False)
+    settings_menu.add_command(label='이름 붙여 설정 저장',command=save_named)
+    settings_menu.add_command(label='저장한 설정 불러오기',command=load_named)
+    menu.add_cascade(label='설정',menu=settings_menu);root.configure(menu=menu)
+    if saved.get('last'):root.after(100,lambda:restore(saved['last']))
     root.protocol('WM_DELETE_WINDOW',root.destroy)
     try: root.mainloop()
     finally: pool.shutdown(wait=False,cancel_futures=True)
@@ -2099,7 +2257,7 @@ def integrate(model,p,t,ag,forces,*,rest=False):
                 # 유체 중점 속도 w + loss[-1]*|w|w = mid[-1]의 안정적인 닫힌 해.
                 w=2*mid[-1]/(1+math.sqrt(1+4*loss[-1]*abs(mid[-1])))
                 mid-=loss*(abs(w)*w)
-            old_q=q.copy();old_v=v.copy()
+            old_q=q;old_v=v
             q=q+dt*mid;v=2*mid-v
             if p and abs(q[-1])>=limit:
                 stop=float(t[i-1]+(j+1)*dt);break
