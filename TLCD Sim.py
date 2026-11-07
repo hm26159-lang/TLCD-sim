@@ -590,13 +590,20 @@ def search_trial(b,d,B,ratio,floor):
     validate(model,test)
     return model,test
 
-def search_designs(b,d,t,ag,betas,angles,lengths,require_peak=True,ratios=None,floors=None,cache=None):
+def search_designs(b,d,t,ag,betas,angles,lengths,require_peak=True,ratios=None,floors=None,cache=None,stop=None,progress=None):
     rows=[];trial_cache={};baseline_cache={}
+    reused=0
+    total=len(betas)*len(angles)*len(lengths)*(1 if ratios is None else len(ratios))*(1 if floors is None else len(floors))
+    def report():
+        if progress is not None:progress.update(total=total,completed=len(rows),reused=reused)
+    report()
     for beta,angle,B,ratio,floor in itertools.product(betas,angles,lengths,
             [None] if ratios is None else ratios,[b.floor_data()[3]] if floors is None else floors):
+        if stop is not None and stop.is_set():break
         key=(float(beta),float(angle),float(B),None if ratio is None else float(ratio),float(floor))
         # cache는 동일 건물·장치·가진을 고정한 한 탐색 창에서만 공유한다.
         row=dict(cache[key]) if cache is not None and key in cache else None
+        if row is not None:reused+=1
         if row is None:
             row=dict(beta=float(beta),angle=float(angle),B=float(B),r=ratio,n=float(floor),
                 h=None,diameter_m=None,area_m2=None,orifice_m2=None,mass_kg=d.mass,
@@ -613,7 +620,7 @@ def search_designs(b,d,t,ag,betas,angles,lengths,require_peak=True,ratios=None,f
                 if test.shape=='U형' and not test.separate_u and test.h<=test.diameter/2:
                     row.update(status='초기 충수 조건 미달',reason=f'h={test.h:.8g} m ≤ D_i/2={test.diameter/2:.8g} m; 현재 보수적 충수 적용 경계',failure_time_s=float(t[0]),completion_pct=0.)
                     if cache is not None:cache[key]=dict(row)
-                    rows.append(row)
+                    rows.append(row);report()
                     continue
                 result=simulate_space(model,test,t,ag,_baseline_cache=baseline_cache)
                 m=metrics(result)
@@ -630,8 +637,33 @@ def search_designs(b,d,t,ag,betas,angles,lengths,require_peak=True,ratios=None,f
                 row.update(status='계산 오류',reason=str(error))
             if cache is not None:cache[key]=dict(row)
         row['eligible']=row['rms_pct'] is not None and row['peak_pct'] is not None and (not require_peak or row['peak_pct']>=-1e-8)
-        rows.append(row)
+        rows.append(row);report()
     return sorted(rows,key=lambda r:(r['eligible'],r['rms_pct'] if r['rms_pct'] is not None else -np.inf),reverse=True)
+
+def select_performance_rows(rows,xkey,ykey,fixed,projection=False):
+    """지도 선택만 수행한다. 값의 보간이나 재계산 없이 실제 행을 반환한다."""
+    if not rows:return [],dict(fixed)
+    others=[key for key in ('r','beta','angle','B','n') if key not in (xkey,ykey)]
+    if projection:
+        grouped={}
+        for row in rows:
+            point=(row[xkey],row[ykey])
+            previous=grouped.get(point)
+            score=row['rms_pct']
+            if previous is None or (score is not None and (previous['rms_pct'] is None or score>previous['rms_pct'])):
+                grouped[point]=row
+        return list(grouped.values()),dict(fixed)
+    selected=list(rows);snapped=dict(fixed)
+    # 단계마다 실제 남아 있는 조합에서 선택하여 드문/중단 격자에서도 존재하는 단면을 보장한다.
+    for key in others:
+        available=sorted(set(float(row[key]) for row in selected if row[key] is not None))
+        if not available:continue
+        target=float(fixed[key])
+        nearest=min(available,key=lambda value:abs(value-target))
+        snapped[key]=nearest
+        selected=[row for row in selected if row[key] is not None and np.isclose(float(row[key]),nearest,rtol=1e-9,atol=1e-12)]
+    return selected,snapped
+
 
 def building_summary(b,r):
     mass,kx,heights,_=b.floor_data()
@@ -1123,8 +1155,8 @@ def lab(b,d,t,ag,title,out):
     ttk.Label(pipe_page,text='관 방향은 동쪽 0° · 북쪽 90°').pack(anchor='w',pady=4)
     tune_ratio=tk.StringVar(value=f'{d.frequency/b.frequency:.8g}')
     ratio_enabled=tk.BooleanVar(value=False)
-    ttk.Checkbutton(freq_page,text='조율비로 설정 (X 1차 모드 기준)',variable=ratio_enabled).pack(anchor='w')
-    ttk.Entry(freq_page,textvariable=tune_ratio,width=10).pack(anchor='w')
+    ttk.Label(freq_page,text='현재 조율비 (X 1차 모드 기준)').pack(anchor='w')
+    ttk.Label(freq_page,textvariable=tune_ratio).pack(anchor='w')
     water_var=tk.StringVar(value=f'{d.mass:.9g}')
     ttk.Label(pipe_page,text='총 물 질량 (kg)').pack(anchor='w')
     ttk.Entry(pipe_page,textvariable=water_var,width=10).pack(anchor='w')
@@ -1588,7 +1620,7 @@ def lab(b,d,t,ag,title,out):
         if position.get()>=end: position.set(0)
         playback.update(running=True,start=time.monotonic()-position.get())
         play.configure(text='Ⅱ 멈춤'); tick()
-    def task(work,done):
+    def task(work,done,on_finish=None):
         if playback['busy']: return
         pause()
         if playback.get('timer'): root.after_cancel(playback['timer'])
@@ -1606,6 +1638,8 @@ def lab(b,d,t,ag,title,out):
             try: done(job.result())
             except Exception as error:
                 status.set('조건을 확인해 주세요.'); messagebox.showerror('실험실',str(error))
+            finally:
+                if on_finish is not None:on_finish()
         root.after(40,poll)
     def calculate(keep_time=False):
         nonlocal ag
@@ -1736,14 +1770,16 @@ def lab(b,d,t,ag,title,out):
         from collections import Counter
         dam=current[0];model=b;times=t.copy();wave=ag.copy()
         # 탐색 창을 연 시점의 물리 조건은 고정한다.
-        source_description=source.get()
+        source_metadata=dict(current[1]['source'])
+        source_description=source.get()+(f" · 가진 {source_metadata['harmonic_hz']:g} Hz" if source_metadata.get('harmonic_hz') else '')
         win=tk.Toplevel(root);win.title('최적 설계 탐색 · 성능 지도');win.geometry('1200x850')
         ttk.Label(win,text='다중 물기둥 형상의 r은 최저 유체모드 기준 · 단면을 함께 조정하여 물 질량 유지').pack(anchor='w')
         labels={'r':'조율비 r','beta':'개구비 β','angle':'설치 각도 θ (°)','B':'수평 길이 B (m)','n':'설치 층 n'}
         keys=list(labels)
+        selectable=[key for key in keys if key!='r']
         ttk.Label(win,text=f'조율 기준 · 세계 X방향 1차 {tuning_frequency(model):.5g} Hz / 총 물 질량 {dam.mass:.5g} kg 고정').pack(anchor='w')
         controls=ttk.Frame(win);controls.pack(fill='x')
-        values={};fixed={};defaults={'r':(.8,1.2,.1),'beta':(.2,.8,.15),'angle':(0,90,45),
+        field_widgets={};values={};fixed={};defaults={'r':(.8,1.2,.1),'beta':(.2,.8,.15),'angle':(0,90,45),
             'B':(dam.B*.8,dam.B*1.2,dam.B*.2),'n':(1,len(model.floor_data()[0]),1)}
         initial={'r':dam.frequency/tuning_frequency(model),'beta':dam.beta,'angle':dam.angle,'B':dam.B,'n':model.floor_data()[3]}
         for col,text in enumerate(['변수','시작','끝','간격','고정값']):
@@ -1752,20 +1788,29 @@ def lab(b,d,t,ag,title,out):
             ttk.Label(controls,text=labels[key]).grid(row=i,column=0,sticky='w')
             values[key]=[tk.StringVar(value=f'{x:.8g}') for x in defaults[key]]
             fixed[key]=tk.StringVar(value=f'{initial[key]:.10g}')
+            if key=='r':
+                ttk.Label(controls,text=f'{initial[key]:.7g} · 현재 설계 기준 고정').grid(row=i,column=1,columnspan=4)
+                continue
             for col,v in enumerate([*values[key],fixed[key]],1):
-                ttk.Entry(controls,textvariable=v,width=12).grid(row=i,column=col)
-        xvar=tk.StringVar(value='r');yvar=tk.StringVar(value='beta');full=tk.BooleanVar(value=False)
+                entry=ttk.Entry(controls,textvariable=v,width=12);entry.grid(row=i,column=col)
+                field_widgets[key,col]=entry
+        xvar=tk.StringVar(value='B');yvar=tk.StringVar(value='beta');full=tk.BooleanVar(value=False)
         peak_rule=tk.BooleanVar(value=True)
+        view_mode=tk.StringVar(value='고정 조건 단면도')
+        selecting=[False]
+        displayed={'cells':{},'axes':None}
         axisbar=ttk.Frame(win);axisbar.pack(fill='x')
         ttk.Label(axisbar,text='X축').pack(side='left')
-        xp=ttk.Combobox(axisbar,textvariable=xvar,values=keys,state='readonly',width=8);xp.pack(side='left')
+        xp=ttk.Combobox(axisbar,textvariable=xvar,values=selectable,state='readonly',width=8);xp.pack(side='left')
         ttk.Label(axisbar,text='Y축').pack(side='left')
-        yp=ttk.Combobox(axisbar,textvariable=yvar,values=keys,state='readonly',width=8);yp.pack(side='left')
-        ttk.Label(axisbar,text='r 조율비 / beta 개구비 / angle 각도'+' / B 길이 / n 층').pack(side='left',padx=8)
-        ttk.Checkbutton(win,text='전체 최적화 · 다섯 변수의 범위를 모두 탐색',variable=full).pack(anchor='w')
+        yp=ttk.Combobox(axisbar,textvariable=yvar,values=selectable,state='readonly',width=8);yp.pack(side='left')
+        mode_picker=ttk.Combobox(axisbar,textvariable=view_mode,values=['고정 조건 단면도','전체 최적화 결과 투영도'],state='readonly',width=25);mode_picker.pack(side='left',padx=5)
+        ttk.Label(axisbar,text='조율비 고정 / beta 개구비 / angle 각도'+' / B 길이 / n 층').pack(side='left',padx=8)
+        ttk.Checkbutton(win,text='전체 최적화 · 조율비를 제외한 네 변수 탐색',variable=full).pack(anchor='w')
         ttk.Checkbutton(win,text='최대 변위 악화 설계는 최적 선정에서 제외',variable=peak_rule).pack(anchor='w')
         feedback=tk.StringVar();ttk.Label(win,textvariable=feedback,wraplength=1150).pack(fill='x')
         columns=('beta','angle','B','r','n','rms_pct','peak_pct','eligible','status','failure_time_s','completion_pct','reason')
+        table_caption=tk.StringVar();ttk.Label(win,textvariable=table_caption,wraplength=1150).pack(fill='x')
         table_frame=ttk.Frame(win);table_frame.pack(fill='x')
         tree=ttk.Treeview(table_frame,columns=columns,show='headings',height=6)
         for key,title in zip(columns,['β','θ (°)','B (m)','r','설치 층','RMS 저감 (%)','최대 저감 (%)','최적 선정 가능','상태','중단 시각 s','완료 %','원인']):
@@ -1775,11 +1820,53 @@ def lab(b,d,t,ag,title,out):
         fig=Figure(figsize=(11,4.5),constrained_layout=True)
         canvas=FigureCanvasTkAgg(fig,master=win);NavigationToolbar2Tk(canvas,win).pack(fill='x')
         canvas.get_tk_widget().pack(fill='both',expand=True)
+        from threading import Event
+        import hashlib
+        inspection=tk.StringVar(value='지도에서 칸을 클릭하면 해당 계산의 다섯 설계값과 선정 가능 여부를 확인합니다.')
+        ttk.Label(win,textvariable=inspection,wraplength=1150).pack(fill='x')
         results=[];memo={};traces={};best_state=[None]
+        run_state={'running':False,'context':None,'progress':{},'cancel':Event(),'locked':[]}
+        progress_text=tk.StringVar()
+        ttk.Label(win,textvariable=progress_text).pack(fill='x')
+        explanation=tk.StringVar()
+        ttk.Label(win,textvariable=explanation,wraplength=1150).pack(fill='x')
+        def update_fields():
+            if run_state['running']:return
+            for key in selectable:
+                varied=full.get() or key in (xvar.get(),yvar.get())
+                for col in range(1,5):
+                    field_widgets[key,col].state(['!disabled'] if (col<=3)==varied else ['disabled'])
+        def lock_inputs():
+            def visit(parent):
+                for widget in parent.winfo_children():
+                    if isinstance(widget,(ttk.Entry,ttk.Button,ttk.Combobox,ttk.Checkbutton,ttk.Radiobutton,ttk.Spinbox)):
+                        run_state['locked'].append((widget,widget.state()))
+                        widget.state(['disabled'])
+                    visit(widget)
+            visit(root)
+            stop_button.state(['!disabled'])
+            root_menu=root.cget('menu')
+            if root_menu:root.nametowidget(root_menu).entryconfigure('설정',state='disabled')
+        def unlock_inputs():
+            run_state['running']=False
+            for widget,state in run_state['locked']:
+                if widget.winfo_exists():
+                    widget.state(['!disabled'])
+                    if 'disabled' in state:widget.state(['disabled'])
+            run_state['locked'].clear()
+            if root.winfo_exists() and root.cget('menu'):root.nametowidget(root.cget('menu')).entryconfigure('설정',state='normal')
+            if win.winfo_exists():update_fields();stop_button.state(['disabled'])
+        def cancel_search():
+            run_state['cancel'].set()
+            progress_text.set('중지 요청 · 현재 설계 계산 완료 후 결과를 보존합니다.')
+        win.bind('<Destroy>',lambda event:run_state['cancel'].set() if event.widget is win else None,add='+')
+
         def grids():
             if xvar.get()==yvar.get():raise ValueError('X축과 Y축에 서로 다른 변수를 선택하세요.')
             output={}
             for key in keys:
+                if key=='r':
+                    output[key]=np.array([initial['r']]);continue
                 if full.get() or key in (xvar.get(),yvar.get()):
                     lo,hi,step=[float(v.get()) for v in values[key]]
                     if not all(np.isfinite([lo,hi,step])) or step<=0 or hi<lo:raise ValueError('시작 ≤ 끝, 간격 > 0으로 입력하세요.')
@@ -1793,14 +1880,22 @@ def lab(b,d,t,ag,title,out):
         guide=tk.StringVar()
         ttk.Label(win,textvariable=guide,wraplength=1150).pack(fill='x')
         def counts(*_):
+            if run_state['running']:return
+            update_fields()
             try:
-                target_r=float(fixed['r'].get())
-                if dam.shape=='U형' and not dam.separate_u and target_r>0:
-                    L=2*G/(2*np.pi*tuning_frequency(model)*target_r)**2
-                    Di=math.sqrt(4*dam.mass/(1000*np.pi*L))
-                    guide.set(f'고정 r={target_r:g}, 질량 유지 D_i={Di*100:.3f} cm · 현재 보수적 초기 충수 기준 h>D_i/2 → 0<B<{L-Di:.6g} m (상한≤0이면 허용 B 없음). r축 탐색 시 각 r별 한계가 다릅니다.')
-                else:guide.set('이 형상은 기둥별 정지 수면·관 끝 높이로 유효성을 검사합니다.')
-                feedback.set(f"예상 계산 조합 {int(np.prod([len(v) for v in grids().values()]))}개 · 축 외 변수는 고정값 사용")
+                g=grids()
+                varied=selectable if full.get() else [xvar.get(),yvar.get()]
+                explanation.set('탐색 · '+', '.join(labels[k] for k in varied)+' / 유지 · '+(', '.join(f'{labels[k]}={fixed[k].get()}' for k in keys if k not in varied) or '없음'))
+                if dam.shape=='U형' and not dam.separate_u:
+                    lines=[]
+                    for ratio in g['r']:
+                        if ratio<=0:raise ValueError('조율비는 양수여야 합니다.')
+                        L=2*G/(2*np.pi*tuning_frequency(model)*ratio)**2
+                        Di=math.sqrt(4*dam.mass/(1000*np.pi*L))
+                        lines.append(f'r={ratio:.5g}: D_i={Di*100:.3f} cm, '+(f'0<B<{L-Di:.6g} m' if L>Di else '허용 B 없음'))
+                    guide.set('현재 모델의 보수적 충수 경계이며 실제 공기 유입 확정 조건이 아닙니다. '+ ' | '.join(lines))
+                else:guide.set('이 형상은 기존 기둥별 수면·관 끝 높이로 검사합니다. U형 B 제한식은 적용하지 않습니다.')
+                feedback.set(f"예상 계산 조합 {int(np.prod([len(v) for v in g.values()]))}개")
             except ValueError as error:feedback.set(str(error))
         def draw(rows):
             if not win.winfo_exists():return
@@ -1811,10 +1906,27 @@ def lab(b,d,t,ag,title,out):
             best=eligible[0] if eligible else None;best_state[0]=best
             feedback.set((f"최적 β={best['beta']:.4g}, θ={best['angle']:.4g}°, B={best['B']:.5g} m, r={best['r']:.5g}, n={best['n']:g} · RMS {best['rms_pct']:+.3f}%, 최대 {best['peak_pct']:+.3f}%" if best else '선정 가능한 최적점 없음')+' · '+str(dict(Counter(row['status'] for row in rows))))
             ax,trace=fig.subplots(1,2)
-            xx,yy=xvar.get(),yvar.get()
-            xs=sorted(set(float(row[xx]) for row in rows if row[xx] is not None));ys=sorted(set(float(row[yy]) for row in rows if row[yy] is not None))
+            context=run_state['context']
+            table_caption.set('표·그래프 계산 조건'+' · '+context['source']+' · 축 '+context['x']+' / '+context['y']+' · '+str(context['fixed'])+' · 최대 변위 비악화 '+str(context['require_peak']))
+            xx,yy=context['x'],context['y']
+            xs=sorted(set(context['grids'][xx]));ys=sorted(set(context['grids'][yy]))
             # 전체 탐색에서는 나머지 변수의 현재 고정값과 일치하는 실제 계산 단면만 표시한다.
-            section=[row for row in rows if all(np.isclose(float(row[k]),float(fixed[k].get()),rtol=1e-7,atol=1e-10) for k in keys if k not in (xx,yy) and row[k] is not None)]
+            requested={}
+            for key in keys:
+                try:requested[key]=float(fixed[key].get())
+                except ValueError:requested[key]=context['fixed'][key]
+            projection=view_mode.get()=='전체 최적화 결과 투영도'
+            section,snapped=select_performance_rows(rows,xx,yy,requested,projection)
+            context.update(view_mode=view_mode.get(),view_fixed=snapped)
+            if not projection:
+                selecting[0]=True
+                try:
+                    for key in keys:
+                        if key not in (xx,yy) and key!='r':fixed[key].set(f'{snapped[key]:.12g}')
+                finally:selecting[0]=False
+            displayed.update(cells={(float(row[xx]),float(row[yy])):row for row in section},axes=ax)
+            table_caption.set('실제 계산 결과 · '+view_mode.get()+' · '+context['source']+' · 표시 단면 '+str(snapped))
+
             matrix=np.full((len(ys),len(xs)),np.nan)
             markers={'정상':'o','최대 변위 악화':'x','수면 상한 도달':'^','수면 하한 도달':'v','모델 적용 범위 초과':'^','초기 충수 조건 미달':'P','잘못된 설계':'s','계산 오류':'D'}
             for row in section:
@@ -1851,13 +1963,14 @@ def lab(b,d,t,ag,title,out):
                     subset=[row for row in section if row['rms_pct'] is not None and row['status']==status and row[xx] is not None and row[yy] is not None]
                     if subset:ax.scatter([r[xx] for r in subset],[r[yy] for r in subset],marker=marker,s=15,color='#202020',label=status)
                 if best and best in section:ax.plot(best[xx],best[yy],'*',ms=15,color='#f3c13a',markeredgecolor='black',label='실제 계산 최적점')
-            ax.set(xlabel=labels[xx],ylabel=labels[yy],title='색상은 전체 구간 RMS · 해칭은 원인별 미완료/무효')
+            ax.set(xlabel=labels[xx],ylabel=labels[yy],title=view_mode.get()+' · 색상 RMS / 해칭 무효 / 빈 칸 미계산')
+            if not section:ax.text(.5,.5,'완료된 계산 결과가 없습니다.',transform=ax.transAxes,ha='center')
             if ax.get_legend_handles_labels()[0]:ax.legend(fontsize=7)
-            fixed_text=', '.join(f'{labels[k]}={fixed[k].get()}' for k in keys if k not in (xx,yy))
+            fixed_text=('투영도 · 각 칸의 최고 RMS (최대 변위 악화도 표시, 선정은 별도)' if projection else '실제 계산 단면 · '+', '.join(f'{labels[k]}={snapped[k]:.6g}' for k in keys if k not in (xx,yy)))
             mass_values,k_values,_,_=model.floor_data()
             condition=f"층 질량 kg={np.array2string(mass_values,precision=3)} · X 강성 N/m={np.array2string(k_values,precision=3)} · Y 강성={np.array2string(np.array(model.stories_y) if model.stories_y else k_values,precision=3)}"
             best_text=(f"최적 β={best['beta']:.4g}, θ={best['angle']:.4g}°, B={best['B']:.4g} m, r={best['r']:.4g}, n={best['n']:g} / RMS {best['rms_pct']:+.2f}%, 최대 {best['peak_pct']:+.2f}%" if best else '선정 가능한 최적점 없음')
-            fig.suptitle(fixed_text+'\n'+source_description+'\n'+condition+'\n'+best_text,fontsize=8)
+            fig.suptitle(('중지된 탐색 · 완료된 조합만 표시\n' if context.get('stopped') else '')+fixed_text+'\n'+source_description+'\n'+condition+'\n'+best_text,fontsize=8)
             if best:
                 rr=traces.get(tuple(best[k] for k in ('beta','angle','B','r','n')))
                 if rr is not None:
@@ -1865,23 +1978,61 @@ def lab(b,d,t,ag,title,out):
                     trace.plot(rr['t'],rr['state'][:,0]*1000,label='최적 설계')
                     trace.legend();trace.set(xlabel='시간 (s)',ylabel='지붕 상대변위 (mm)')
             canvas.draw_idle()
+        def inspect_cell(event):
+            if event.inaxes is not displayed['axes'] or event.xdata is None:return
+            points=list(displayed['cells'])
+            if not points:return
+            context=run_state['context'];xkey,ykey=context['x'],context['y']
+            xs=sorted(set(context['grids'][xkey]));ys=sorted(set(context['grids'][ykey]))
+            x=min(xs,key=lambda value:abs(value-event.xdata))
+            y=min(ys,key=lambda value:abs(value-event.ydata))
+            row=displayed['cells'].get((x,y))
+            if row is None:
+                inspection.set('이 칸에 실제 계산된 조합이 없습니다.');return
+            details=' · '.join(f'{labels[k]}={row[k]:.7g}' for k in keys)
+            score='전체 구간 성능값 없음' if row['rms_pct'] is None else f"RMS {row['rms_pct']:+.4f}% / 최대 {row['peak_pct']:+.4f}%"
+            inspection.set(details+' · '+score+f" · {row['status']} · 최적 선정 가능 {row['eligible']} · "+row['reason'])
+        canvas.mpl_connect('button_press_event',inspect_cell)
+        mode_picker.bind('<<ComboboxSelected>>',lambda _:draw(results) if run_state['context'] else None)
         def start():
+            if run_state['running'] or playback['busy']:return
             try:g=grids();rule=peak_rule.get()
             except ValueError as error:feedback.set(str(error));return
-            feedback.set(f"{int(np.prod([len(v) for v in g.values()]))}개 평가 중 · 기존 결과 재사용")
+            if pending[0]:win.after_cancel(pending[0]);pending[0]=None
+            context=dict(x=xvar.get(),y=yvar.get(),fixed={k:float(g[k][0]) if full.get() or k in (xvar.get(),yvar.get()) else float(v.get()) for k,v in fixed.items()},
+                grids={k:v.tolist() for k,v in g.items()},full=full.get(),require_peak=rule,
+                building=asdict(model),damper=asdict(dam),source=source_description,source_metadata=source_metadata,
+                excitation_sha256=hashlib.sha256(times.tobytes()+wave.tobytes()).hexdigest(),
+                duration_s=float(times[-1]-times[0]),samples=len(times),stopped=False)
+            run_state.update(running=True,context=context,progress={})
+            run_state['cancel'].clear();lock_inputs()
+            def monitor():
+                if not win.winfo_exists() or not run_state['running']:return
+                p=run_state['progress']
+                progress_text.set(f"완료 {p.get('completed',0)} / {p.get('total',0)} · 캐시 재사용 {p.get('reused',0)}"+(' · 중지 요청됨' if run_state['cancel'].is_set() else ''))
+                if run_state['running']:win.after(100,monitor)
+            monitor()
             def compute():
-                rows=search_designs(model,dam,times,wave,g['beta'],g['angle'],g['B'],rule,g['r'],g['n'],memo)
+                rows=search_designs(model,dam,times,wave,g['beta'],g['angle'],g['B'],rule,g['r'],g['n'],memo,
+                    stop=run_state['cancel'],progress=run_state['progress'])
+                context['stopped']=run_state['cancel'].is_set()
                 valid=[row for row in rows if row['eligible']]
-                if valid:
+                if valid and not context['stopped']:
                     best=valid[0];key=tuple(best[k] for k in ('beta','angle','B','r','n'))
                     if key not in traces:
                         mb,dd=search_trial(model,dam,best['B'],best['r'],best['n'])
                         traces[key]=simulate_space(mb,replace(dd,beta=best['beta'],angle=best['angle']),times,wave)
                 return rows
-            task(compute,draw)
+            def display(rows):
+                if win.winfo_exists():
+                    draw(rows)
+                    p=run_state['progress']
+                    progress_text.set(f"{'중지됨' if context['stopped'] else '완료'} · 평가 {len(rows)} / {p.get('total',0)} · 캐시 {p.get('reused',0)} · 미계산 {p.get('total',0)-len(rows)}")
+            task(compute,display,on_finish=unlock_inputs)
         def swap():
             x,y=xvar.get(),yvar.get();xvar.set(y);yvar.set(x)
-            if results:draw(results)
+            if run_state['context']:
+                run_state['context'].update(x=xvar.get(),y=yvar.get());draw(results)
             else:counts()
         def refine():
             best=best_state[0]
@@ -1901,24 +2052,26 @@ def lab(b,d,t,ag,title,out):
             path=filedialog.asksaveasfilename(parent=win,defaultextension='.csv')
             if path:
                 with open(path,'w',newline='',encoding='utf-8-sig') as f:
-                    writer=csv.DictWriter(f,fieldnames=results[0]);writer.writeheader();writer.writerows(results)
+                    writer=csv.DictWriter(f,fieldnames=[*results[0],'calculation_context']);writer.writeheader();writer.writerows(dict(row,calculation_context=json.dumps(run_state['context'],ensure_ascii=False)) for row in results)
         def save_png():
             path=filedialog.asksaveasfilename(parent=win,defaultextension='.png',filetypes=[('PNG','*.png')])
             if path:fig.savefig(path,dpi=300)
         buttons=ttk.Frame(controls);buttons.grid(row=6,column=0,columnspan=5)
         for label,command in [('계산 / 지도 갱신',start),('축 교환',swap),('최적점 주변 정밀 탐색',refine),('CSV 저장',save_csv),('PNG 300 dpi 저장',save_png)]:
             ttk.Button(buttons,text=label,command=command).pack(side='left')
+        stop_button=ttk.Button(buttons,text='중지',command=cancel_search,state='disabled');stop_button.pack(side='left')
         for group in values.values():
             for value in group:value.trace_add('write',counts)
         pending=[None]
         def fixed_changed(*_):
+            if selecting[0]:return
             counts()
             if pending[0]:win.after_cancel(pending[0])
             if results:
                 def refresh_map():
                     if not win.winfo_exists():return
                     if playback['busy']:pending[0]=win.after(300,refresh_map)
-                    else:pending[0]=None;start()
+                    else:pending[0]=None;draw(results)
                 pending[0]=win.after(600,refresh_map)
         for value in fixed.values():value.trace_add('write',fixed_changed)
         for value in (xvar,yvar,full):value.trace_add('write',counts)
@@ -2248,6 +2401,7 @@ def lab(b,d,t,ag,title,out):
                     if name in variable_groups and key in variable_groups[name]:variable_groups[name][key].set(value)
             leg_specs.clear()
             leg_specs.update({k:tuple(tuple(x) for x in pair) for k,pair in data['legs'].items()})
+            ratio_enabled.set(False)
             reference_size=restored_reference
             wave_note.set(presets[kind_var.get()])
             update_dimension_labels();switch_tune()
@@ -2739,8 +2893,9 @@ def calculate_multistory(snapshot=None):
         harmonic_on=HARMONIC_ON,harmonic_hz=HARMONIC_HZ,harmonic_amplitude=AMPLITUDE,
         ground_csv=str(GROUND_CSV) if GROUND_CSV else None,designs=cases,
         sweep_hz=SWEEP_HZ,sweep_amplitude=SWEEP_AMPLITUDE,sweep_cycles=SWEEP_CYCLES,measure_cycles=MEASURE_CYCLES)
+    metadata['analysis_scope']='세계 X방향 강성·한 방향 U형 설계 모델'
     if snapshot is not None:
-        metadata.update(wave=snapshot['source']['wave'],requested_dt_s=float(t[1]-t[0]),
+        metadata.update(source=snapshot['source'],wave=snapshot['source']['wave'],requested_dt_s=float(t[1]-t[0]),
             duration_s=float(t[-1]-t[0]), harmonic_on=False,ground_csv=None,
             initial_floor_u=[0.]*N,initial_floor_v=[0.]*N,initial_water_y=0.,initial_water_v=0.)
     return dict(model=model,t=t,ag=ag,forces=forces,omega=omega,phi=phi,cases=cases,results=results,rows=all_rows,mode_rows=mode_rows,design_rows=design_rows,freq=freq,metadata=metadata)
@@ -2751,6 +2906,9 @@ def show_multistory(win, result):
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    ttk.Label(win,text='세계 X방향 강성의 한 방향 U형 설계 분석 · 현재 3D 장치 형상과 별도로 REF 및 코드 상단 설계를 계산합니다.',wraplength=950).pack(anchor='w')
+    reference=result['cases'][0]
+    ttk.Label(win,text=f"층 질량 kg={result['metadata']['masses_kg']} · X 강성 N/m={result['metadata']['stiffness_N_m']} · 가진={result['metadata'].get('wave','코드 상단 가진')} · REF L={reference['L']:g} m / B={reference['B']:g} m / β={reference['beta']:g} / 설치 {reference['floor']}층",wraplength=950).pack(anchor='w')
     bar=ttk.Frame(win,padding=8);bar.pack(fill='x')
     tabs=ttk.Notebook(win);tabs.pack(fill='both',expand=True)
     chart=ttk.Frame(tabs);tabs.add(chart,text='그래프')
@@ -2868,5 +3026,3 @@ def main():
 
 if __name__=='__main__':
     main()
-
-
