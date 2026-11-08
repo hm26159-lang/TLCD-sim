@@ -14,6 +14,8 @@ import math
 import numpy as np
 
 G = 9.80665
+# 결합계의 가장 짧은 고유주기를 충분히 나누어 공진 부근 위상 오차를 줄인다.
+INTERNAL_POINTS_PER_PERIOD = 200
 
 # 아래 설정은 해석 메뉴의 다층 U형 실험에 적용합니다.
 # ── 실험 설정: 이 부분에서 조건을 바꾸세요. 길이 m, 시간 s, 질량 kg, 힘 N ──
@@ -149,7 +151,7 @@ class Damper:
 
     @property
     def frequency(self):
-        if self.shape!='U형' or self.separate_u:
+        if not equivalent_u(self):
             mf,kf=network(self)[7:9]
             return math.sqrt(np.linalg.eigvals(np.linalg.solve(mf,kf)).real.min())/(2*np.pi)
         return math.sqrt(2 * G / self.length) / (2 * np.pi)
@@ -158,6 +160,13 @@ class Damper:
     def limit(self):
         # 수면이 바닥에 닿거나 관 밖으로 넘치면 현재 모델을 적용할 수 없다.
         return min(self.h, self.freeboard)
+
+
+def equivalent_u(d):
+    """동일 B,h,D를 가진 두 수직 물기둥. 형상 이름과 무관하게 같은 모델·경계를 사용한다."""
+    return not d.separate_u and (d.shape=='U형' or
+        (d.shape=='다기둥형' and d.columns==2) or
+        (d.shape=='V형' and math.isclose(d.tilt,90.,abs_tol=1e-12)))
 
 
 def orifice_loss(beta):
@@ -263,8 +272,39 @@ def recorded_input():
     return np.arange(len(raw))*.02, raw*(.03*G/np.max(np.abs(raw)))
 
 
+def laboratory_input(hz, amplitude, mode='가속도 진폭 (g)'):
+    """변위 x=A sin(ωt)에 대응하는 가속도 -ω²A sin(ωt)를 만든다."""
+    if not math.isfinite(hz) or hz <= 0:
+        raise ValueError('진동수는 유한한 양수 Hz로 입력하세요.')
+    if not math.isfinite(amplitude) or amplitude < 0:
+        raise ValueError('진폭은 유한한 0 이상 값으로 입력하세요.')
+    if hz >= 25:
+        raise ValueError('현재 시간 간격에서 진동수는 25 Hz 미만이어야 합니다.')
+    omega = 2*np.pi*hz
+    if mode == '가속도 진폭 (g)':
+        accel = amplitude*G
+        displacement = accel/omega**2
+    elif mode == '변위 진폭 (cm)':
+        displacement = amplitude/100
+        accel = omega**2*displacement
+    else:
+        raise ValueError('진폭 입력 방식을 선택하세요.')
+    if not math.isfinite(accel) or not math.isfinite(displacement):
+        raise ValueError('진동수 또는 진폭이 너무 큽니다.')
+    # 조화 입력의 선형 보간 오차를 줄이도록 한 주기당 최소 100개 표본을 둔다.
+    dt=min(.02,1/(100*hz))
+    t=np.linspace(0.,30.,int(math.ceil(30/dt))+1)
+    signal = -accel*np.sin(omega*t)
+    meta = dict(wave='단방향', harmonic_hz=hz, amplitude_mode=mode,
+        amplitude_value=amplitude, displacement_amplitude_m=displacement,
+        site_pga_g=accel/G, bearing_deg=0.,
+        initial_ground_velocity_m_s=omega*displacement,
+        phase='x=A sin(2πft), a=-(2πf)² A sin(2πft)')
+    return t, signal, meta
+
+
 QUAKE_NOTES={
-    '단방향':'입력한 Hz로 반복하는 일정 진폭 지반 가속도입니다. 정지 상태에서 출발하므로 건물 응답은 초기에 커질 수 있습니다.',
+    '단방향':'실험실 조화 가진 · 세계 X방향. 진동수와 진폭을 직접 지정합니다. 기본 0.01 g는 실행용 가정값입니다. 건물의 초기 상대 변위·속도는 0입니다.',
     '고베지진':'1995년 JMA 고베 남북 실측. 가까운 관측소에서 기록된 급격한 흔들림입니다. 첫 40초를 사용합니다.',
     '멕시코시티 지진':'1985년 호수 퇴적층 관측 특성을 본뜬 합성파입니다. 약 2초 주기 성분을 증폭해 길게 흔들립니다.',
     '엘센트로 지진':'1940년 엘센트로 남북 실측. 기존에 사용한 31.16초 기록입니다.'}
@@ -307,11 +347,8 @@ def quake_wave(kind, hz=1.):
         a=np.frombuffer(zlib.decompress(base64.b85decode(packed)),dtype='<i4')*1e-5
         t=np.arange(len(a))*.02
     elif kind=='단방향':
-        t=np.arange(1501)*.02
-        # 일정 진폭의 지반 가속도 조화 가진. 포락선과 기록 추세 보정을 적용하지 않는다.
-        if not np.isfinite(hz) or hz<=0:raise ValueError('진동수는 양수 Hz여야 합니다.')
-        a=np.cos(2*np.pi*hz*t)
-        return t,.03*G*a
+        t, a, _ = laboratory_input(hz, .01)
+        return t, a
     elif kind=='멕시코시티 지진':
         t=np.arange(3001)*.02
         rng=np.random.default_rng(1985)
@@ -442,12 +479,12 @@ def draw_result(fig, axes, b, d, r, title):
         for j,level in enumerate(r['levels'].T):water.plot(r['t'],1000*(level+np.broadcast_to(r['rest_height'],r['levels'].shape[1])[j]),label=f'기둥 {j+1}')
         for bound in np.unique(r['lower_water']+r['rest_height']):water.axhline(bound*1000,color='red',ls='--')
         for bound in np.unique(r['upper_water']+r['rest_height']):water.axhline(bound*1000,color='red',ls=':')
-        water.legend(fontsize=8);water.set(title='수면 높이 · 바닥 관 중심선 기준',ylabel='실제 높이 [mm]')
+        water.legend(fontsize=8);water.set(title='수면 높이 기준: 바닥 관 중심선',ylabel='실제 높이 [mm]')
     else:
         water.plot(r['t'], 1000*r['state'][:, 2], color='#0284c7')
         for sign in [-1, 1]:
             water.axhline(sign*1000*d.limit, color='#dc2626', ls='--')
-        water.set(title='오른쪽 수면 변화 · 왼쪽은 반대', ylabel='수면 변화 [mm]')
+        water.set(title='오른쪽 수면 변화(왼쪽은 반대가 됨)', ylabel='수면 변화 [mm]')
     for ax in [disp, accel, water]:
         ax.set_xlabel('시간 [s]'); ax.grid(alpha=0.2)
         if not r['valid']:
@@ -486,6 +523,11 @@ def save_result(folder, b, d, r, fig, title):
     payload['source'] = r.get('source')
     payload['failure_detail']=r.get('failure_detail')
     payload['fluid_model']=r.get('fluid_model')
+    payload['physics_limits']=[
+        '선형 전단 건물: 비틀림·전도 회전·소성·지반-기초 상호작용 미포함',
+        '1차원 물기둥 근사: 접합부 3차원 흐름·기포·부분 충수·슬로싱 미해석',
+        '관벽·곡관·분기점 추가 손실은 보정 자료가 없어 미포함',
+        '수평관 천장 경계는 보수적 적용 제한이며 공기 유입 확정 조건 아님']
     payload['geometry_scope']=r.get('geometry_scope')
     payload['valid_interval_metrics']=partial_metrics(r)
     payload['building_summary']=building_summary(b,r)
@@ -549,7 +591,7 @@ def search_trial(b,d,B,ratio,floor):
         raise ValueError('설치 층은 건물 범위 안의 정수여야 합니다.')
     if ratio is None:
         test=replace(d,B=float(B),h=(d.length-B)/2)
-    elif d.shape=='U형' and not d.separate_u:
+    elif equivalent_u(d):
         if not np.isfinite(ratio) or ratio<=0:raise ValueError('조율비는 양수여야 합니다.')
         L=2*G/(2*np.pi*tuning_frequency(b)*ratio)**2
         if B<=0 or B>=L:raise ValueError('B < L이어야 합니다. 조율비 또는 B를 줄이세요.')
@@ -571,7 +613,8 @@ def search_trial(b,d,B,ratio,floor):
             if frequency(hi)<=target:break
             hi*=2
         else:raise ValueError('물높이 조율의 해를 찾지 못했습니다.')
-        for _ in range(65):
+        for _ in range(48):
+            if hi-lo<=1e-11*max(1.,hi):break
             mid=(lo+hi)/2
             if frequency(mid)>target:lo=mid
             else:hi=mid
@@ -616,8 +659,8 @@ def search_designs(b,d,t,ag,betas,angles,lengths,require_peak=True,ratios=None,f
                 validate(model,test)
                 row.update(r=test.frequency/tuning_frequency(b) if ratio is None else float(ratio),h=test.h,diameter_m=test.diameter,
                     area_m2=test.area,orifice_m2=test.area*test.beta,initial_h_m=test.h,initial_D_m=test.diameter,
-                    B_limit_m=test.length-test.diameter if test.shape=='U형' and not test.separate_u else None)
-                if test.shape=='U형' and not test.separate_u and test.h<=test.diameter/2:
+                    B_limit_m=test.length-test.diameter if equivalent_u(test) else None)
+                if equivalent_u(test) and test.h<=test.diameter/2:
                     row.update(status='초기 충수 조건 미달',reason=f'h={test.h:.8g} m ≤ D_i/2={test.diameter/2:.8g} m; 현재 보수적 충수 적용 경계',failure_time_s=float(t[0]),completion_pct=0.)
                     if cache is not None:cache[key]=dict(row)
                     rows.append(row);report()
@@ -730,6 +773,7 @@ def network(d):
     if d.shape=='V형':
         tilt=np.radians(d.tilt)
         up[:,0]=[-np.cos(tilt),np.cos(tilt)];up[:,2]=np.sin(tilt)
+        if equivalent_u(d):up[:]=[0.,0.,1.]
     delta=ends-starts
     length=np.linalg.norm(delta,axis=1)
     rhoA=1000*d.area
@@ -774,7 +818,7 @@ def network_response(b,d,t,ag,installed=True,baseline_cache=None):
     M[attached,fluid:]=cross;M[fluid:,attached]=cross.T
     M[fluid:,fluid:]=fluid_mass;K[fluid:,fluid:]=fluid_k
     excitation=np.ones(size);excitation[n:2*n]=0;excitation[4*n:6*n]=0;excitation[fluid:]=0
-    eff=np.linalg.inv(M); load=M@excitation
+    load=M@excitation
     active=np.r_[np.arange(2*n),np.arange(fluid,size)]
     Ma=M[np.ix_(active,active)];Ka=K[np.ix_(active,active)];Ca=C[np.ix_(active,active)]
     la=load[active]
@@ -786,13 +830,19 @@ def network_response(b,d,t,ag,installed=True,baseline_cache=None):
     # 일반 원형 U관의 보수적인 전단면 충수 적용 경계.
     # 수평 관 중심선 z=0, 내측 천장 z=D/2. 접합부/자유수면의 3차원 형상은 미해석.
     # 이는 공기 유입을 확정하는 실험식이 아니라 고전 물기둥 모델의 적용 제한이다.
-    standard_u=installed and d.shape=='U형' and not d.separate_u
+    standard_u=installed and equivalent_u(d)
     lower_rise=np.broadcast_to(-np.asarray(leg),S.shape[0]).copy()
     if standard_u:lower_rise+=d.diameter/2
     q=np.zeros(size);v=np.zeros(size)
     Q=np.full((len(t),size),np.nan);V=Q.copy();Q[0]=q;V[0]=v
-    fmax=np.sqrt(np.linalg.eigvals(eff@K).real.max())
-    stepmax=min(.01,2*np.pi/(100*fmax))
+    try:
+        chol=np.linalg.cholesky(Ma)
+    except np.linalg.LinAlgError as error:
+        raise ValueError('유체-구조 결합 질량행렬이 양의 정부호가 아닙니다. 형상과 질량을 확인하세요.') from error
+    transformed=np.linalg.solve(chol,Ka)
+    transformed=np.linalg.solve(chol,transformed.T).T
+    fmax=np.sqrt(np.linalg.eigvalsh(transformed).max())
+    stepmax=min(.01,2*np.pi/(INTERNAL_POINTS_PER_PERIOD*fmax))
     nvalid=1;failure=None;failure_kind=None;failure_detail="";last_h=None
     original_t=t;original_ag=ag
     t=t.copy();ag=ag.copy()
@@ -808,21 +858,27 @@ def network_response(b,d,t,ag,installed=True,baseline_cache=None):
             vm=inv@Ma;qm=-h*inv@Ka;force=-h*inv@la;drag=h*inv[:,-modes:]
             # 1~3개의 가지 유속만을 미지수로 두는 중점법의 비선형 저항 방정식
             transfer=T@drag[-modes:]@T.T
+            scalar_flow=len(weights)==1
+            if scalar_flow:
+                scalar_coefficient=float(transfer[0,0]*weights[0])
+                scalar_drag=drag[:,0]*float(T[0,0])*weights[0]
+                scalar_path=float(T[0,0])
             last_h=h
         for j in range(count):
             gm=ag[i-1]+(ag[i]-ag[i-1])*(j+.5)/count
             free=vm@v[active]+qm@q[active]+force*gm
-            rhs=T@free[-modes:];flow=rhs.copy()
-            if len(weights)==1:
-                coefficient=float(transfer[0,0]*weights[0])
-                flow=2*rhs/(1+np.sqrt(1+4*coefficient*abs(rhs)))
+            if scalar_flow:
+                rhs=scalar_path*float(free[-1])
+                velocity=2*rhs/(1+math.sqrt(1+4*scalar_coefficient*abs(rhs)))
+                full_mid[active]=free-scalar_drag*(abs(velocity)*velocity)
             else:
+                rhs=T@free[-modes:];flow=rhs.copy()
                 for _ in range(20):
                     residual=flow+transfer@(weights*abs(flow)*flow)-rhs
                     if max(abs(residual))<1e-11*(1+max(abs(rhs))):break
                     flow-=np.linalg.solve(flow_eye+transfer*(2*weights*abs(flow)),residual)
                 else:raise ValueError('유체 저항 계산이 수렴하지 않았습니다. 입력 조건을 확인하세요.')
-            full_mid[active]=free-drag@(T.T@(weights*abs(flow)*flow))
+                full_mid[active]=free-drag@(T.T@(weights*abs(flow)*flow))
             mid=full_mid
             old_q=q;old_v=v
             q=q+dt*mid;v=2*mid-v
@@ -854,17 +910,18 @@ def network_response(b,d,t,ag,installed=True,baseline_cache=None):
                 break
         if failure is not None:break
         Q[i]=q;V[i]=v;nvalid+=1
+    baseline_blocks=[]
     for indices in (np.r_[np.arange(2*n,3*n),np.arange(4*n,5*n)],
                     np.r_[np.arange(3*n,4*n),np.arange(5*n,6*n)]):
         mb=M[np.ix_(indices,indices)];kb=K[np.ix_(indices,indices)];cb=C[np.ix_(indices,indices)]
-        cache_key=(mb.tobytes(),kb.tobytes(),cb.tobytes())
+        # 비교 대상도 TLCD와 같은 내부 시간 간격으로 적분한다.
+        # 다른 간격의 기준 응답을 재사용하면 저감률에 수치 오차가 섞인다.
+        cache_key=(mb.tobytes(),kb.tobytes(),cb.tobytes(),stepmax)
         stored=baseline_cache.get(cache_key) if baseline_cache is not None else None
         if stored is None:
             qb=np.zeros(2*n);vb=qb.copy();influence=np.r_[np.ones(n),np.zeros(n)]
             qb_history=np.zeros((len(original_t),2*n));vb_history=qb_history.copy()
-            root=np.sqrt(np.diag(mb))
-            frequency_max=math.sqrt(np.linalg.eigvalsh(kb/root[:,None]/root[None,:]).max())
-            base_step=min(.01,2*np.pi/(100*frequency_max))
+            base_step=stepmax
             last_dt=None
             for i,span in enumerate(np.diff(original_t),1):
                 steps=max(1,int(np.ceil(span/base_step-1e-10)));dt=span/steps;half=dt/2
@@ -885,7 +942,10 @@ def network_response(b,d,t,ag,installed=True,baseline_cache=None):
     force=-np.nan_to_num(Q)@K.T-np.nan_to_num(V)@C.T
     currents=np.nan_to_num(V[:,fluid:])@T.T
     force[:,fluid:]-=(weights*abs(currents)*currents)@T
-    acc=force@eff.T
+    acc=np.zeros_like(force)
+    acc[:,active]=np.linalg.solve(Ma,force[:,active].T).T
+    for indices,mb in baseline_blocks:
+        acc[:,indices]=np.linalg.solve(mb,force[:,indices].T).T
     acc[nvalid:,:2*n]=np.nan
     heights=(Q[:,fluid:]@S.T)*up[:,2]
     speeds=(V[:,fluid:]@S.T)*up[:,2]
@@ -1015,7 +1075,7 @@ def lab(b,d,t,ag,title,out):
     tr=ttk.Frame(shape_page);tr.pack(fill='x',pady=4)
     ttk.Label(tr,text='V형 경사각 (°)').pack(side='left')
     ttk.Entry(tr,textvariable=tilt_var,width=7).pack(side='right')
-    ttk.Label(shape_page,text='같은 물을 각 기둥에 나눠 채웁니다.\n모양 비교 시 빈 관 질량도 고정합니다.').pack(anchor='w')
+    ttk.Label(shape_page,text='각 기둥 당 같은 질량으로 물 분배\n모양 비교 시 빈 관 질량도 고정합니다.').pack(anchor='w')
     column_var=tk.StringVar(value=str(d.columns))
     row=ttk.Frame(shape_page);row.pack(fill='x')
     ttk.Label(row,text='다기둥형 기둥 수').pack(side='left')
@@ -1047,7 +1107,7 @@ def lab(b,d,t,ag,title,out):
             window.destroy();calculate()
         ttk.Button(window,text='적용',command=accept).grid(row=2+2*len(groups),column=0,columnspan=3)
     ttk.Button(shape_page,text='U관 기둥별 안지름 · 높이',command=edit_legs).pack(fill='x')
-    settings.add(pipe_page,text='관 설정');settings.add(quake_page,text='진원 · 세기')
+    settings.add(pipe_page,text='관 설정');settings.add(quake_page,text='가진 입력')
     freq_page=ttk.Frame(settings,padding=6)
     settings.add(freq_page,text='각진동수')
     omega_b=tk.StringVar(value=f'{2*math.pi*b.frequency:.9g}')
@@ -1121,16 +1181,30 @@ def lab(b,d,t,ag,title,out):
     hz_var=tk.StringVar(value='1')
     ttk.Label(quake_page,text='단방향 진동수 (Hz)').pack(anchor='w')
     ttk.Entry(quake_page,textvariable=hz_var,width=8).pack(anchor='w')
+    amplitude_mode=tk.StringVar(value='가속도 진폭 (g)')
+    amplitude_var=tk.StringVar(value='0.01')
+    ttk.Combobox(quake_page,textvariable=amplitude_mode,
+        values=['가속도 진폭 (g)','변위 진폭 (cm)'],state='readonly',width=22).pack(fill='x')
+    ttk.Entry(quake_page,textvariable=amplitude_var,width=10).pack(anchor='w')
+    ttk.Label(quake_page,text='진폭은 중심에서 최대값 · 기본 0.01 g는 실행용 가정값\n변위 x=A sin(2πft), 가속도 a=−(2πf)² A sin(2πft)',wraplength=245).pack(anchor='w')
     original_wave=ag
     reference_peak=float(np.max(np.abs(ag))/G)
     src=Source(strength=reference_peak)
     quake_fields={}
+    source_entries=[]
     for key,label in [('east','동쪽 위치 (km)'),('north','북쪽 위치 (km)'),('depth','깊이 (km)'),('strength','10 km 기준 세기 (g)')]:
         row=ttk.Frame(quake_page);row.pack(fill='x',pady=2)
         ttk.Label(row,text=label).pack(side='left')
         quake_fields[key]=tk.StringVar(value=str(round(getattr(src,key),12)))
-        ttk.Entry(row,textvariable=quake_fields[key],width=10).pack(side='right')
-    ttk.Label(quake_page,text='건물 위치 (0, 0) · 음수는 서쪽/남쪽\n세기 = 기준 거리의 최대 지면 가속도').pack(anchor='w')
+        entry=ttk.Entry(row,textvariable=quake_fields[key],width=10)
+        entry.pack(side='right');source_entries.append(entry)
+    ttk.Label(quake_page,text='지진 모드용 진원·세기 설정\n건물 위치 (0, 0) · 음수는 서쪽/남쪽').pack(anchor='w')
+    def update_wave_controls(*_):
+        wave_note.set(presets[kind_var.get()])
+        for entry in source_entries:
+            entry.configure(state='disabled' if kind_var.get()=='단방향' else 'normal')
+    kind_var.trace_add('write',update_wave_controls)
+    update_wave_controls()
     pipe_on=tk.BooleanVar(root,True)
     fields={}
     dimension_labels={}
@@ -1454,41 +1528,46 @@ def lab(b,d,t,ag,title,out):
             for obj in list(objects):
                 if isinstance(obj[0],tuple) and obj[0][0]=='tube':
                     scene.delete(objects.pop(obj))
-        # 진원은 km 단위이므로 건물과 별도 축척의 평면도·단면도에 표시한다.
-        mx,my=width*.83,height*.33
-        size=min(width*.105,height*.14)
-        east,north,depth=meta['east'],meta['north'],meta['depth']
-        span=max(1.,abs(east),abs(north))
-        factor=size/span
-        sx,sy=mx+factor*east,my-factor*north
-        paint('mapcard','rectangle',(mx-size-22,my-size-26,mx+size+22,my+size+23),fill='#ffffff',outline='#d4dfe5')
-        paint('mapx','line',(mx-size,my,mx+size,my),fill='#d5dfe5')
-        paint('mapy','line',(mx,my-size,mx,my+size),fill='#d5dfe5')
-        # 지도 화살표의 시작은 진원 바로 위의 점, 끝은 건물이다.
-        paint('map-arrow','line',(sx,sy,mx,my),fill='#d4473e',width=3,arrow='last',arrowshape=(9,11,4))
-        paint('site','rectangle',(mx-4,my-4,mx+4,my+4),fill='#18394b',outline='')
-        paint('surface-point','oval',(sx-4,sy-4,sx+4,sy+4),fill='#d4473e',outline='white')
-        name='건물 바로 아래' if not (east or north) else ('북' if north>0 else '남' if north<0 else '')+('동' if east>0 else '서' if east<0 else '')+'쪽'
-        paint('map-caption','text',(mx,my+size+12),text=f'● 진앙   ■ 건물',fill='#344f60')
-        # 건물 모서리 아래에 가려지지 않도록 지붕 위에 독립적인 방향 지시선을 둔다.
-        uv=(np.array([math.cos(bearing),math.sin(bearing),0.])@P)
-        uv=uv/max(1e-12,np.linalg.norm(uv))
-        target=np.array([width*.33,42.])
-        start=target-uv*min(width*.09,46.)
-        overhead=not(east or north)
-        if overhead: start=target-np.array([0.,20.])
-        paint('direction','line',(*start,*target),fill='#d4473e',width=3,arrow='last',arrowshape=(9,11,4))
-        paint('arrival','text',(width*.51,40),text=f'{name}에서 도달' if not overhead else '건물 바로 아래 진원',fill='#943e39')
-        paint('map-title','text',(mx,my-size-13),text='진앙 → 건물  |  위쪽은 북쪽',fill='#304c5c')
-        surface=height*.65
-        paint('ground','line',(mx-size,surface,mx+size,surface),fill='#69858e')
-        section_scale=size/max(1.,abs(east),depth)
-        sx=mx+east*section_scale
-        sz=surface+section_scale*depth
-        paint('depthline','line',(sx,surface,sx,sz),fill='#cf8985',dash=(3,3))
-        paint('hypocenter','oval',(sx-5,sz-5,sx+5,sz+5),fill='#d43d39',outline='')
-        paint('section','text',(mx,surface-12),text='동서 단면 · 빨간 점은 진원',fill='#304c5c')
-        paint('depth','text',(mx,sz+15),text=f"깊이 {meta['depth']:g} km",fill='#913a34')
+        if meta.get('wave')=='단방향':
+            paint('lab-caption','text',(width*.83,height*.33),
+                text=f"실험실 · 세계 X방향\n{meta['harmonic_hz']:g} Hz\n가속도 진폭 {meta['site_pga_g']:.5g} g\n변위 진폭 {meta['displacement_amplitude_m']*100:.5g} cm",
+                fill='#304c5c')
+        else:
+            # 진원은 km 단위이므로 건물과 별도 축척의 평면도·단면도에 표시한다.
+            mx,my=width*.83,height*.33
+            size=min(width*.105,height*.14)
+            east,north,depth=meta['east'],meta['north'],meta['depth']
+            span=max(1.,abs(east),abs(north))
+            factor=size/span
+            sx,sy=mx+factor*east,my-factor*north
+            paint('mapcard','rectangle',(mx-size-22,my-size-26,mx+size+22,my+size+23),fill='#ffffff',outline='#d4dfe5')
+            paint('mapx','line',(mx-size,my,mx+size,my),fill='#d5dfe5')
+            paint('mapy','line',(mx,my-size,mx,my+size),fill='#d5dfe5')
+            # 지도 화살표의 시작은 진원 바로 위의 점, 끝은 건물이다.
+            paint('map-arrow','line',(sx,sy,mx,my),fill='#d4473e',width=3,arrow='last',arrowshape=(9,11,4))
+            paint('site','rectangle',(mx-4,my-4,mx+4,my+4),fill='#18394b',outline='')
+            paint('surface-point','oval',(sx-4,sy-4,sx+4,sy+4),fill='#d4473e',outline='white')
+            name='건물 바로 아래' if not (east or north) else ('북' if north>0 else '남' if north<0 else '')+('동' if east>0 else '서' if east<0 else '')+'쪽'
+            paint('map-caption','text',(mx,my+size+12),text=f'● 진앙   ■ 건물',fill='#344f60')
+            # 건물 모서리 아래에 가려지지 않도록 지붕 위에 독립적인 방향 지시선을 둔다.
+            uv=(np.array([math.cos(bearing),math.sin(bearing),0.])@P)
+            uv=uv/max(1e-12,np.linalg.norm(uv))
+            target=np.array([width*.33,42.])
+            start=target-uv*min(width*.09,46.)
+            overhead=not(east or north)
+            if overhead: start=target-np.array([0.,20.])
+            paint('direction','line',(*start,*target),fill='#d4473e',width=3,arrow='last',arrowshape=(9,11,4))
+            paint('arrival','text',(width*.51,40),text=f'{name}에서 도달' if not overhead else '건물 바로 아래 진원',fill='#943e39')
+            paint('map-title','text',(mx,my-size-13),text='진앙 → 건물  |  위쪽은 북쪽',fill='#304c5c')
+            surface=height*.65
+            paint('ground','line',(mx-size,surface,mx+size,surface),fill='#69858e')
+            section_scale=size/max(1.,abs(east),depth)
+            sx=mx+east*section_scale
+            sz=surface+section_scale*depth
+            paint('depthline','line',(sx,surface,sx,sz),fill='#cf8985',dash=(3,3))
+            paint('hypocenter','oval',(sx-5,sz-5,sx+5,sz+5),fill='#d43d39',outline='')
+            paint('section','text',(mx,surface-12),text='동서 단면 · 빨간 점은 진원',fill='#304c5c')
+            paint('depth','text',(mx,sz+15),text=f"깊이 {meta['depth']:g} km",fill='#913a34')
         paint('header','text',(12,10),text=(f"{r['mount']}층 관 설치" if r.get('installed',True) else '관 없음')+'   /   드래그로 시점 회전',anchor='nw',fill='#233d50')
         for obj in list(objects):
             if isinstance(obj[0],tuple) and obj[0][0]=='dimension':
@@ -1547,7 +1626,7 @@ def lab(b,d,t,ag,title,out):
             ground=r['ground']
             arrays=1000*np.column_stack((ground,ground+r['first'][:,0],ground+r['state'][:,0]))
         if idx==4: legend.set('정지 기준 위치   ·   회색  지면       주황  1층       파랑  지붕')
-        elif idx in (0,1): legend.set('회색  장치 없음       주황  같은 무게 고정       파랑  TLCD')
+        elif idx in (0,1): legend.set('회색: 장치 없음       주황: 무게추(TLCD무게만큼)       파랑: TLCD적용')
         else: legend.set('파랑  TLCD를 설치한 모형')
         if off and idx!=4: legend.set('관 없음 · 건물 응답' if idx!=2 else '관 없음 · 물 높이 측정 대상 없음')
         if idx>=5 and not off: legend.set(f'{view_floor.get()}층   ·   회색  장치 없음       파랑  현재 TLCD')
@@ -1711,20 +1790,24 @@ def lab(b,d,t,ag,title,out):
                 vals['bores']=tuple(None if x is None else x*scale for x in vals['bores'])
                 fields['diameter'].set(f"{vals['diameter']*100:.9g}")
             raw=replace(d,**vals); validate(target_b,raw)
-            quake=Source(**{key:float(field.get()) for key,field in quake_fields.items()})
             kind=kind_var.get()
             if kind=='단방향':
-                hz=float(hz_var.get())
-                if not np.isfinite(hz) or hz<=0:raise ValueError('진동수는 양수 Hz로 입력하세요.')
-                wave_cache[kind]=quake_wave(kind,hz)
-            if kind not in wave_cache:wave_cache[kind]=quake_wave(kind)
-            timeline,input_wave=wave_cache[kind]
-            signal,relative,meta=quake.input_for(input_wave,raw.angle)
+                timeline,signal,meta=laboratory_input(float(hz_var.get()),
+                    float(amplitude_var.get()),amplitude_mode.get())
+                quake=None
+                relative=raw.angle%180
+            else:
+                quake=Source(**{key:float(field.get()) for key,field in quake_fields.items()})
+                if kind not in wave_cache:wave_cache[kind]=quake_wave(kind)
+                timeline,input_wave=wave_cache[kind]
+                signal,relative,meta=quake.input_for(input_wave,raw.angle)
+                meta['harmonic_hz']=None
             target_b=replace(target_b,bearing=meta['bearing_deg'])
-            meta['harmonic_hz']=float(hz_var.get()) if kind=='단방향' else None
             meta['wave']=kind
+            meta['heading_deg']=raw.angle
             dam=replace(raw,angle=relative,reverse=(raw.angle-meta['bearing_deg'])%360>=180)
-            key=(quake,raw,target_b,enabled,kind,float(hz_var.get()) if kind=="단방향" else None)
+            key=(quake,raw,target_b,enabled,kind,meta.get('harmonic_hz'),
+                meta.get('amplitude_mode'),meta.get('amplitude_value'))
         except ValueError as error:
             pipe_on.set(current[1].get('installed',True))
             messagebox.showerror('입력 확인',str(error)); return
@@ -1733,6 +1816,10 @@ def lab(b,d,t,ag,title,out):
             nonlocal ag,b,t
             t=r["t"]
             ag=r["ag"]
+            if kind=='단방향':
+                # 사인 변위의 초기 지면 속도는 ωA이다. 정지 초기값으로 이중 적분하면 표류한다.
+                r['ground']=meta['displacement_amplitude_m']*np.sin(2*np.pi*meta['harmonic_hz']*t)
+                r['travel']=np.nanmax(np.hypot(r['floors_x'],r['floors_y']))+max(abs(r['ground']))
             b=target_b
             omega_b.set(f'{2*np.pi*b.frequency:.9g}')
             count_var.set(str(count))
@@ -1745,7 +1832,9 @@ def lab(b,d,t,ag,title,out):
             tune_ratio.set(f'{dam.frequency/b.frequency:.8g}')
             r['building_spec']=target_b
             cache[key]=r; r['source']=meta; current[:]=[dam,r]
-            source.set(f"{kind}  ·  {count}층 / 관 {mount}층   ·   진원 거리 {meta['distance_km']:.1f} km   ·   건물 입력 {meta['site_pga_g']:.4f} g   ·   관과 진동 방향 {relative:.1f}°")
+            location=(f"실험실 {meta['harmonic_hz']:g} Hz · 변위 진폭 {meta['displacement_amplitude_m']*100:g} cm" if kind=='단방향'
+                else f"진원 거리 {meta['distance_km']:.1f} km")
+            source.set(f"{kind}  ·  {count}층 / 관 {mount}층   ·   {location}   ·   건물 입력 {meta['site_pga_g']:.4f} g   ·   관과 진동 방향 {relative:.1f}°")
             model_info=building_summary(b,r)
             frequency_note.set(f"X 1차 {model_info['fx']:.4f} Hz / Y 1차 {model_info['fy']:.4f} Hz")
             r['building_summary']=model_info
@@ -1886,7 +1975,7 @@ def lab(b,d,t,ag,title,out):
                 g=grids()
                 varied=selectable if full.get() else [xvar.get(),yvar.get()]
                 explanation.set('탐색 · '+', '.join(labels[k] for k in varied)+' / 유지 · '+(', '.join(f'{labels[k]}={fixed[k].get()}' for k in keys if k not in varied) or '없음'))
-                if dam.shape=='U형' and not dam.separate_u:
+                if equivalent_u(dam):
                     lines=[]
                     for ratio in g['r']:
                         if ratio<=0:raise ValueError('조율비는 양수여야 합니다.')
@@ -2171,11 +2260,13 @@ def lab(b,d,t,ag,title,out):
         if any(previous is r for _,previous in history):
             status.set('이미 담긴 실험이에요. 조건을 바꾸고 적용하세요.');return
         m=r['source']
-        name=(f"실험 {len(history)+1}  |  ω 건물 {2*math.pi*b.frequency:.2f} / 물 {2*math.pi*dam.frequency:.2f} rad/s  |  진원 ({m['east']:g}, {m['north']:g}, 깊이 {m['depth']:g}) km"
-              f"  ·  기준 {m['strength']:g} g  ·  관 {m['heading_deg']:g}°"
+        excitation=(f"실험실 {m['harmonic_hz']:g} Hz · 진폭 {m['site_pga_g']:g} g" if m.get('wave')=='단방향'
+            else f"진원 ({m['east']:g}, {m['north']:g}, 깊이 {m['depth']:g}) km · 기준 {m['strength']:g} g")
+        name=(f"실험 {len(history)+1}  |  ω 건물 {2*math.pi*b.frequency:.2f} / 물 {2*math.pi*dam.frequency:.2f} rad/s  |  {excitation}"
+              f"  ·  관 {m['heading_deg']:g}°"
               f"  ·  길이/물높이/지름 {dam.B*100:g}/{dam.h*100:g}/{dam.diameter*100:g} cm  ·  개구비 {dam.beta:g}")
         mode=dam.shape if r.get('installed',True) else '관 없음'
-        if mode=='관 없음': name=f"실험 {len(history)+1} | 진원 ({m['east']:g}, {m['north']:g}, 깊이 {m['depth']:g}) km · 기준 {m['strength']:g} g · 건물 {2*math.pi*b.frequency:.2f} rad/s"
+        if mode=='관 없음': name=f"실험 {len(history)+1} | {excitation} · 건물 {2*math.pi*b.frequency:.2f} rad/s"
         if dam.shape=='다기둥형':mode+=f' {dam.columns}기둥'
         if dam.separate_u and r.get('installed',True):
             _,bores,_,_,tops=u_dimensions(dam)
@@ -2327,7 +2418,7 @@ def lab(b,d,t,ag,title,out):
             '모양 선택만 바꾸면 물 총부피와 빈 관 질량이 유지됩니다. 바닥 총길이 B를 가지에 나누고, 기준 U형 물 높이 h의 두 배를 모든 다리에 나눕니다. V형은 수평 기준 경사각이며 피자 거치대는 120도 간격 3개, 다기둥형은 일렬 2~24개입니다. 독립 U관 3개는 같은 설치 층에 고정되며 관마다 좌우 물 부피 변화가 상쇄됩니다. 기둥 안지름을 바꾸면 물의 양을 유지하도록 정지 수면을 다시 계산합니다. 그림의 차단판 효과는 손실계수로 근사합니다.\n\n'
             '진원 좌표는 건물을 기준으로 입력합니다. 가상 지진은 진원에서 건물로 향하는 수평선 방향으로 흔들린다고 가정합니다. 바로 아래 진원은 동쪽을 기준으로 사용합니다.\n\n'
             '세기는 진원 거리 10 km에서의 최대 가속도(g)입니다. 같은 파형에 거리 계수 √101 / √(거리²+1)을 곱합니다(거리 단위 km). 모든 기록은 진동 도착 시점부터 비교합니다. 실제 지반, 지진 규모, 파의 도착시간은 계산 범위 밖입니다.\n\n'
-            '오리피스 개구비 경험식만 적용하며 관벽 마찰·곡관 손실은 생략합니다. 분기관과 비대칭 관에서 경험식 적용 범위는 검증되지 않았습니다.\n\n물은 관을 따라 움직이는 한 물기둥으로 계산합니다. 물의 관성, 두 수면 높이 차에 따른 중력, 유속의 제곱에 비례하는 저항이 들어갑니다. 3D 화면은 이 계산값을 보여줍니다.')
+            '오리피스 개구비 경험식만 적용하며 관벽 마찰·곡관 손실은 생략합니다. 분기관과 비대칭 관에서 경험식 적용 범위는 검증되지 않았습니다.\n\n물은 관을 따라 움직이는 한 물기둥으로 계산합니다. 물의 관성, 두 수면 높이 차에 따른 중력, 유속의 제곱에 비례하는 저항이 들어갑니다. 3D 화면은 이 계산값을 보여줍니다.\n\n건물은 선형 전단 모형으로 비틀림, 전도 회전, 소성 및 지반-기초 상호작용은 포함하지 않습니다. 물의 기포, 부분 충수, 접합부 3차원 흐름은 계산 범위 밖입니다. 이 효과의 계수와 구조 자료 없이 실제 응답을 보정했다고 주장할 수 없습니다.')
     for label,cmd in [('조건 적용',calculate),('최적 설계 탐색',optimize),('현재 실험 담기',remember),('실험 그래프 비교',history_window),('각도별 그래프 비교',angle_window),('형상 × 각도 비교',compare),('결과 저장',save),('물과 지진 계산 원리',model_info)]:
         ttk.Button(panel,text=label,command=cmd).pack(fill='x',pady=3)
     ttk.Separator(panel).pack(fill='x',pady=12)
@@ -2367,6 +2458,7 @@ def lab(b,d,t,ag,title,out):
     variables=dict(shape=shape_var,tilt=tilt_var,columns=column_var,count=count_var,mount=mount_var,
         damping=damping_var,width=size_vars[0],depth=size_vars[1],size_link=size_link,
         stiffness_mode=stiffness_mode,water_mass=water_var,wave=kind_var,hz=hz_var,
+        amplitude_mode=amplitude_mode,amplitude=amplitude_var,
         omega_b=omega_b,omega_l=omega_l,tune=tune_mode,ratio=tune_ratio,
         ratio_enabled=ratio_enabled,pipe_on=pipe_on)
     def snapshot():
@@ -2394,6 +2486,8 @@ def lab(b,d,t,ag,title,out):
                 wave_cache[values['wave']]=tuple(np.array(x,float) for x in data['custom_wave'])
                 presets[values['wave']]='저장한 사용자 입력 기록입니다.'
                 kind_box.configure(values=list(presets))
+            # 진폭 항목이 없는 예전 설정에도 실행용 기본값을 적용한다.
+            amplitude_mode.set('가속도 진폭 (g)');amplitude_var.set('0.01')
             for key,value in values.items():
                 if key in variables:variables[key].set(value)
             for name,group in groups.items():
@@ -2586,7 +2680,7 @@ def integrate(model,p,t,ag,forces,*,rest=False):
     reduced=np.linalg.solve(factor,K)
     reduced=np.linalg.solve(factor,reduced.T).T
     fastest=math.sqrt(np.linalg.eigvalsh(reduced).max())
-    maxdt=min(MAX_INTERNAL_DT,2*np.pi/(80*fastest))
+    maxdt=min(MAX_INTERNAL_DT,2*np.pi/(INTERNAL_POINTS_PER_PERIOD*fastest))
     q=np.zeros(dim);v=np.zeros(dim)
     if not rest:
         q[:N]=vector('초기 변위',np.zeros(N) if U0 is None else U0,N)
@@ -2724,7 +2818,7 @@ def run_sweep(model,cases):
         factor=np.linalg.cholesky(M)
         left=np.linalg.solve(factor,K)
         fastest=math.sqrt(np.linalg.eigvalsh(np.linalg.solve(factor,left.T).T).max())
-        prepared.append((p['code'] if p else 'BARE',p,matrices,min(MAX_INTERNAL_DT,2*np.pi/(80*fastest))))
+        prepared.append((p['code'] if p else 'BARE',p,matrices,min(MAX_INTERNAL_DT,2*np.pi/(INTERNAL_POINTS_PER_PERIOD*fastest))))
     rows=[]
     for hz in SWEEP_HZ:
         positive('주파수 실험의 주파수',hz)
@@ -3026,3 +3120,5 @@ def main():
 
 if __name__=='__main__':
     main()
+
+
