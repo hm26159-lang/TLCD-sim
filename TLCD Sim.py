@@ -1,11 +1,42 @@
-"""TLCD 형상·설치 방향 실험. 실행: python TLCD_3D.py
+"""TLCD 실험실. 실행 방법은 python TLCD_3D.py 입니다.
 
-NumPy, Matplotlib만 사용한다. 모든 계산 단위는 m, kg, s이다.
-건물은 수평 두 축으로 움직이고 물은 U자 관을 따라 이동한다.
-지붕은 회전하지 않으며 건물의 두 수평 방향 강성과 감쇠는 같다.
+[코드를 읽는 순서]
+1. Building, Damper: 건물과 관의 입력값 및 단위.
+2. lab() 안의 calculate(): 화면 문자열 → SI 단위 → 검증 → 모델 생성.
+3. laboratory_input()/quake_wave(): 시간 t와 지반 가속도 ag(t) 생성.
+4. network(): 관 형상 → 유체 질량·강성·유량 변환·건물 결합행렬.
+5. simulate_space() → network_response(): 유체-구조 연성 시간 이력 계산.
+6. metrics(): 계산 완료 여부 확인 → 같은 시간 구간의 최대값·RMS·저감률.
+7. search_designs(): 같은 건물·가진·물 질량으로 설계 조합을 비교.
+8. lab()의 draw_scene()/draw_chart(): 계산된 결과를 표시. 그림 자체가 물리 계산은 아님.
+9. snapshot()/restore(): 이름 있는 설정과 마지막 적용 설정을 JSON에 보관.
+
+[단위와 좌표]
+내부 단위는 m, kg, s, N, rad/s. 화면의 cm는 calculate()에서 100으로 나눈다.
+Hz는 초당 진동 횟수이며 각진동수는 omega=2*pi*f이다.
+층별 건물 변위는 지반 기준 상대 변위, 그래프의 절대가속도는 상대가속도+지반가속도.
+세계 X·Y 방향의 층별 강성은 독립 입력. 가진 방향 좌표로 회전하여 적분한다.
+기본 U형 B는 양 수직관 중심선 사이 거리, h는 수평관 중심선부터 정지 수면까지 높이.
+L=B+2h는 중심선 기반의 이상화된 물기둥 길이. 둥근 곡관의 실제 체적 보정은 미포함.
+
+[입력 우선순위 / 별도 계산]
+주 실험실은 화면의 층별 값과 물 질량·안지름을 사용한다. h는 이 값에서 자동 계산한다.
+TLCD 목표 각진동수 설정을 켜면 h와 안지름을 함께 조절해 입력 물 질량을 유지한다.
+건물 강성 '직접 입력' 모드에서는 목표 건물 omega 입력이 사용되지 않는다.
+단방향 실험실 가진은 Hz와 진폭을 사용한다. 진원 위치·지진 세기는 이 모드에서 사용하지 않는다.
+아래 N, MASSES, REFERENCE 등의 상수는 별도 U형 설계·모드 분석의 기본값이다.
+이 별도 분석은 한 방향 모델이며 3D 장치의 임의 형상을 그대로 계산하지 않는다.
+
+[아직 반영하지 못한 물리]
+1차원 연속 물기둥과 선형 전단 건물의 근사이다. 공기 유입 이후·부분 충수·기포,
+유체의 3차원 접합부 흐름, 추가 관벽·곡관 손실, 건물 비틀림·소성·기초 상호작용은 미포함.
+오리피스 개구비 경험식의 분기관·비대칭 관 적용은 실험 검증이 필요하다.
+수평관 천장 기준의 수면 제한은 보수적인 모델 적용 경계이며 실제 공기 유입 판정식이 아니다.
+NumPy·Matplotlib 및 Python 기본 Tkinter를 사용한다.
 """
 from dataclasses import dataclass, replace, asdict
 from pathlib import Path
+from functools import lru_cache
 import itertools
 import argparse
 import csv
@@ -60,10 +91,13 @@ PLOT_CUSTOM_ID = 'D01'
 
 
 
+# 건물 입력 묶음. GUI의 m/k/y/h 목록이 masses/stories/stories_y/heights로 전달된다.
+# width·depth는 외형 치수이며, 크기 연동을 켠 경우에만 기준 면적비로 질량을 바꾼다. 강성은 독립 입력이다.
 @dataclass(frozen=True)
 class Building:
     mass: float = 20.0       # 물과 관을 제외한 모형 구조물 질량 [kg]
     frequency: float = 1.0   # 장치가 없는 구조물의 고유진동수 [Hz]
+    # 주 계산은 C=(2*zeta/omega_X1)*K. X 1차 모드가 이 감쇠비를 갖고 다른 모드의 감쇠비는 달라진다.
     damping: float = 0.02    # 구조물 감쇠비: 0.02 = 2%
     container_mass: float = 0.0  # 관 자체 질량 [kg], 실제 측정값으로 변경
 
@@ -71,6 +105,7 @@ class Building:
     depth: float = .44  # 건물 앞뒤(m)
     stories_y: tuple = ()
     bearing: float = 0.
+    # 비어 있는 목록 대신 비어 있는 튜플이면 기본 2층 모형. 값이 있으면 층별 목록을 우선한다.
     masses: tuple = ()
     stories: tuple = ()
     heights: tuple = ()
@@ -103,6 +138,8 @@ class Building:
         return 2 * self.damping * self.mass * 2 * np.pi * self.frequency
 
 
+# 관 입력 묶음. B,h,diameter는 m, angle·tilt는 도 단위이다.
+# 물 밀도는 주 계산에서 1000 kg/m³로 고정. beta는 면적비이며 유체 손실계수는 내부 계산한다.
 @dataclass(frozen=True)
 class Damper:
     B: float = 0.30          # 바닥 수평 관의 중심선 길이 [m]
@@ -151,10 +188,8 @@ class Damper:
 
     @property
     def frequency(self):
-        if not equivalent_u(self):
-            mf,kf=network(self)[7:9]
-            return math.sqrt(np.linalg.eigvals(np.linalg.solve(mf,kf)).real.min())/(2*np.pi)
-        return math.sqrt(2 * G / self.length) / (2 * np.pi)
+        # 같은 불변 설계의 미리보기·표·탐색에서 고유치 계산을 반복하지 않는다.
+        return damper_frequency(self,G)
 
     @property
     def limit(self):
@@ -169,6 +204,21 @@ def equivalent_u(d):
         (d.shape=='V형' and math.isclose(d.tilt,90.,abs_tol=1e-12)))
 
 
+@lru_cache(maxsize=256)
+def damper_frequency(d,gravity):
+    # 캐시는 스칼라 결과만 저장한다. 네트워크 행렬/시간 이력 배열은 캐싱하지 않는다.
+    if equivalent_u(d):return math.sqrt(2*gravity/d.length)/(2*np.pi)
+    mass,stiffness=network(d)[7:9]
+    root=np.linalg.cholesky(mass)
+    normalized=np.linalg.solve(root,stiffness)
+    normalized=np.linalg.solve(root,normalized.T).T
+    squared=np.linalg.eigvalsh(normalized)
+    if squared[0]<=0:raise ValueError('유체 고유진동수가 양수가 아닙니다. 형상을 확인하세요.')
+    return math.sqrt(squared[0])/(2*np.pi)
+
+
+# beta=Ao/A → xi. xi는 무차원이며 힘은 0.5*rho*A*xi*v*abs(v) [N].
+# 분기관의 유속은 network()의 T 변환을 사용한다. 관벽/곡관 저항을 추가한 식은 아니다.
 def orifice_loss(beta):
     if not np.isfinite(beta) or not 0<beta<=1:
         raise ValueError('오리피스 개구비 β는 0 초과, 1 이하여야 합니다.')
@@ -272,6 +322,8 @@ def recorded_input():
     return np.arange(len(raw))*.02, raw*(.03*G/np.max(np.abs(raw)))
 
 
+# Hz와 선택한 진폭(g 또는 cm) → 같은 사인 지반운동의 가속도/변위.
+# 변위 진폭을 고정하고 Hz를 높이면 가속도 진폭은 omega²에 비례해 커진다.
 def laboratory_input(hz, amplitude, mode='가속도 진폭 (g)'):
     """변위 x=A sin(ωt)에 대응하는 가속도 -ω²A sin(ωt)를 만든다."""
     if not math.isfinite(hz) or hz <= 0:
@@ -310,6 +362,8 @@ QUAKE_NOTES={
     '엘센트로 지진':'1940년 엘센트로 남북 실측. 기존에 사용한 31.16초 기록입니다.'}
 # JMA Kobe: https://www.data.jma.go.jp/eqev/data/kyoshin/jishin/hyogo_nanbu/index.html
 # Mexico City: USGS OFR 85-731 그림 3. 관측 지반의 장주기 성분을 설명하는 교육용 모델.
+# 지진 종류 → 시간과 지반 가속도 배열. 고베·엘센트로는 내장 기록, 멕시코시티는 특성 모사 합성파.
+# 실측 지진의 모든 방향 성분·지반 특성을 재현하지 않는다.
 def quake_wave(kind, hz=1.):
     if kind=='엘센트로 지진':return recorded_input()
     if kind=='고베지진':
@@ -381,15 +435,20 @@ def load_input(path, unit):
     return t - t[0], a * factor
 
 
+# state의 열 4,6,0은 각각 장치 없음/같은 질량 고정/유체가 움직이는 건물의 지붕 변위.
+# valid=False이면 전체 구간 저감률을 반환하지 않는다. 부분 결과는 partial_metrics()에서 별도 표시한다.
 def metrics(result):
     # 넘침/바닥 도달 후에는 전체 기록의 저감률을 보고하지 않는다.
     if not result['valid']:
         return None
+    # 세 비교 대상의 지붕 상대 변위를 같은 시간 구간으로 꺼낸다.
     x = result['state'][:, [4, 6, 0]]
     peak = np.max(np.abs(x), axis=0)
+    # 제곱 변위를 시간 적분하고 전체 시간으로 나눈 뒤 제곱근을 취한다. 표본이 등간격이 아니어도 사용 가능하다.
     rms = np.sqrt(np.trapezoid(x*x, result['t'], axis=0) / np.ptp(result['t']))
     acc = np.max(np.abs(result['acc']), axis=0)
     def reduction(values, base):
+        # 양수는 응답 감소, 음수는 증가. 기준 응답이 거의 0이면 나눗셈 대신 None을 반환한다.
         return float(100 * (1-values[2]/values[base])) if values[base] > 1e-12 else None
     return {'peak_displacement_m': peak.tolist(), 'rms_displacement_m': rms.tolist(),
             'peak_absolute_acceleration_m_s2': acc.tolist(),
@@ -398,6 +457,7 @@ def metrics(result):
             'rms_reduction_vs_bare_pct': reduction(rms, 0),
             'acceleration_reduction_vs_bare_pct': reduction(acc, 0),
             'peak_water_displacement_m': float(np.max(np.abs(result.get('levels',result['state'][:,2]))))}
+
 
 
 def partial_metrics(r):
@@ -531,9 +591,16 @@ def save_result(folder, b, d, r, fig, title):
     payload['geometry_scope']=r.get('geometry_scope')
     payload['valid_interval_metrics']=partial_metrics(r)
     payload['building_summary']=building_summary(b,r)
+    payload['input_application']=dict(
+        h='물 질량·안지름·B로 계산된 값; 독립 직접 입력으로 사용하지 않음',
+        source='단방향 모드는 실험실 진폭/Hz를 사용하며 진원 좌표/strength를 사용하지 않음' if r.get('source',{}).get('wave')=='단방향' else '진원 방향과 가상 거리 배율로 기록 조정',
+        damping='C=(2*zeta/omega_X1)*K; 모든 모드에 동일 감쇠비가 아님',
+        density_kg_m3=1000.)
     (folder/'summary.json').write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
+# 형상×각도 비교. 총 L과 단면적을 유지하면서 B를 바꾸고 h=(L-B)/2로 조정한다.
+# 최적 설계 창의 탐색은 search_designs()를 사용하므로 변수 조합 규칙이 다르다.
 def sweep(b, d, t, ag, folder=None, metric="peak_reduction_vs_bare_pct"):
     """총 물 길이와 지름을 유지하면서 B/L과 설치 각도를 비교한다."""
     plt = setup_plot()
@@ -580,11 +647,14 @@ def sweep(b, d, t, ag, folder=None, metric="peak_reduction_vs_bare_pct"):
 
 
 
+@lru_cache(maxsize=128)
 def tuning_frequency(b):
     mass,k,_,_=b.floor_data()
     D=np.eye(len(mass))-np.eye(len(mass),k=-1)
     return float(modes(np.diag(mass),D.T@(k[:,None]*D))[0][0]/(2*np.pi))
 
+# 탐색 B·조율비·설치 층 → 계산 가능한 Building/Damper 한 쌍.
+# 주 화면에서는 조율비를 고정한다. 내부 인자는 기존 설계 재현과 결과 재계산을 위해 유지한다.
 def search_trial(b,d,B,ratio,floor):
     floor_value=float(floor)
     if not floor_value.is_integer() or not 1<=floor_value<=len(b.floor_data()[0]):
@@ -633,6 +703,8 @@ def search_trial(b,d,B,ratio,floor):
     validate(model,test)
     return model,test
 
+# 물리 계산을 순서대로 수행하는 탐색 엔진. cache는 같은 건물·장치·가진을 고정한 창에서만 재사용한다.
+# 초기 충수 부족은 적분 전에 제외하고, 중지 요청은 한 설계의 계산이 끝난 뒤 반영한다.
 def search_designs(b,d,t,ag,betas,angles,lengths,require_peak=True,ratios=None,floors=None,cache=None,stop=None,progress=None):
     rows=[];trial_cache={};baseline_cache={}
     reused=0
@@ -652,6 +724,7 @@ def search_designs(b,d,t,ag,betas,angles,lengths,require_peak=True,ratios=None,f
                 h=None,diameter_m=None,area_m2=None,orifice_m2=None,mass_kg=d.mass,
                 rms_pct=None,peak_pct=None,status='',reason='',eligible=False,failure_time_s=None,completion_pct=0.,initial_h_m=None,initial_D_m=None,B_limit_m=None)
             try:
+                # 같은 B·조율비·설치 층에서는 형상 조율을 재사용한다. 개구비와 각도는 이후에 별도로 적용한다.
                 geometry_key=(float(B),None if ratio is None else float(ratio),float(floor))
                 if geometry_key not in trial_cache:trial_cache[geometry_key]=search_trial(b,d,float(B),ratio,floor)
                 model,test=trial_cache[geometry_key]
@@ -660,12 +733,15 @@ def search_designs(b,d,t,ag,betas,angles,lengths,require_peak=True,ratios=None,f
                 row.update(r=test.frequency/tuning_frequency(b) if ratio is None else float(ratio),h=test.h,diameter_m=test.diameter,
                     area_m2=test.area,orifice_m2=test.area*test.beta,initial_h_m=test.h,initial_D_m=test.diameter,
                     B_limit_m=test.length-test.diameter if equivalent_u(test) else None)
+                # 초기 물높이가 현재 충수 적용 경계보다 낮으면 적분 전에 별도 상태로 기록한다. 실제 공기 유입을 확정하는 판정은 아니다.
                 if equivalent_u(test) and test.h<=test.diameter/2:
                     row.update(status='초기 충수 조건 미달',reason=f'h={test.h:.8g} m ≤ D_i/2={test.diameter/2:.8g} m; 현재 보수적 충수 적용 경계',failure_time_s=float(t[0]),completion_pct=0.)
                     if cache is not None:cache[key]=dict(row)
                     rows.append(row);report()
                     continue
+                # 모든 후보가 동일한 시간 배열과 지반 가속도를 받는 실제 계산 호출이다.
                 result=simulate_space(model,test,t,ag,_baseline_cache=baseline_cache)
+                # 전체 기록을 완료한 경우에만 RMS·최대값을 성능 점수로 사용한다.
                 m=metrics(result)
                 if m is None:
                     row.update(status='초기 충수 조건 미달' if result['failure_time']<=t[0] else result.get('failure_kind','수면 한계'),
@@ -679,10 +755,13 @@ def search_designs(b,d,t,ag,betas,angles,lengths,require_peak=True,ratios=None,f
             except (np.linalg.LinAlgError,FloatingPointError) as error:
                 row.update(status='계산 오류',reason=str(error))
             if cache is not None:cache[key]=dict(row)
+        # 성능값 표시와 최적 선정은 별개이다. 최대 변위가 악화되어도 RMS 값은 지도에 남긴다.
         row['eligible']=row['rms_pct'] is not None and row['peak_pct'] is not None and (not require_peak or row['peak_pct']>=-1e-8)
         rows.append(row);report()
     return sorted(rows,key=lambda r:(r['eligible'],r['rms_pct'] if r['rms_pct'] is not None else -np.inf),reverse=True)
 
+# 표시할 행만 선택하는 함수. 시뮬레이션이나 보간을 수행하지 않는다.
+# 투영도는 각 칸의 최고 RMS 실제 행을 선택한다. 최대 변위 조건의 선정 가능 여부는 별도이다.
 def select_performance_rows(rows,xkey,ykey,fixed,projection=False):
     """지도 선택만 수행한다. 값의 보간이나 재계산 없이 실제 행을 반환한다."""
     if not rows:return [],dict(fixed)
@@ -721,6 +800,8 @@ def building_summary(b,r):
 
 SHAPES=('U형','피자 거치대','V형','다기둥형','독립 U관 3개')
 
+# 독립 U관 및 비대칭 U관의 단면적·정지 수면·관 끝 높이.
+# 관 끝 높이는 넘침 여유에만 사용한다. 물의 양은 물 질량 입력이 정하며 정지 시 같은 U관의 좌우 수면은 수평이다.
 def u_dimensions(d):
     # 같은 물 질량으로 비교한다. 바닥 관 길이 합은 B, 수직 부분 물 부피 합은 2Ah.
     spans=d.B*(np.array([.25,.25,.5]) if d.shape=='독립 U관 3개' else np.ones(1))
@@ -737,6 +818,8 @@ def u_dimensions(d):
         raise ValueError('각 기둥 끝은 정지 수면보다 높아야 합니다. 높이를 늘리거나 물을 줄이세요.')
     return spans,bores,areas,rest,tops
 
+# 세 독립 U관은 서로 물이 이동하지 않는다. 각 U관의 질량·강성 블록만 독립이다.
+# 건물 자유도를 공유하므로 건물에 전달하는 힘을 통해 간접적으로 상호작용한다.
 def independent_network(d):
     spans,bores,areas,rest,tops=u_dimensions(d)
     count=len(spans)
@@ -756,18 +839,23 @@ def independent_network(d):
     return feet,up,rest,starts,ends,S,np.eye(count),inertia,spring,coupling
 
 
+# 관 형상 → feet/up/leg/starts/ends, S/T, 유체 M/K, 건물 결합항.
+# S@유체좌표는 각 기둥의 수면 변화, T@유체속도는 각 바닥 유로의 평균 유속. 각 연결망의 체적 보존을 만족한다.
 def network(d):
     """각 가지의 물속 길이와 방향. 분기점에서 들어온 부피와 나간 부피가 같다."""
     if d.separate_u:return independent_network(d)
     n={'피자 거치대':3,'다기둥형':d.columns}.get(d.shape,2)
     leg=2*d.h/n
+    # 마지막 기둥의 수면을 나머지 기둥의 반대로 정해 같은 단면에서 총 물 체적을 보존한다.
     surface=np.vstack([np.eye(n-1),-np.ones(n-1)])
+    # 세 바닥 가지의 중심선 길이 합을 B로 나눈다. 방위는 120도 간격이다.
     if d.shape=='피자 거치대':
         az=np.arange(n)*2*np.pi/n
         feet=d.B/n*np.column_stack((np.cos(az),np.sin(az),np.zeros(n)))
         starts=np.zeros_like(feet); ends=feet.copy(); paths=surface
     else:
         feet=np.column_stack((np.linspace(-d.B/2,d.B/2,n),np.zeros((n,2))))
+        # 일렬 연결관에서는 누적 체적 이동으로 각 바닥 구간의 유속을 결정한다.
         starts=feet[:-1];ends=feet[1:];paths=-np.cumsum(surface,axis=0)[:-1]
     up=np.tile([0.,0.,1.],(n,1))
     if d.shape=='V형':
@@ -777,21 +865,34 @@ def network(d):
     delta=ends-starts
     length=np.linalg.norm(delta,axis=1)
     rhoA=1000*d.area
+    # 관 길이별 유체 운동에너지에서 유체 질량행렬을 만든다.
     inertia=rhoA*(leg*surface.T@surface+paths.T@(length[:,None]*paths))
+    # 수면 높이 차의 중력 위치에너지에서 복원 강성을 만든다. V형의 수직 성분도 반영한다.
     spring=rhoA*G*surface.T@(up[:,2,None]*surface)
     coupling=rhoA*(delta[:,:2].T@paths+leg*up[:,:2].T@surface)
     return feet,up,leg,starts,ends,surface,paths,inertia,spring,coupling
 
 
+
+# 실제 연성 적분기. 좌표와 결과 배열의 열 순서를 아래 주석과 함께 확인한다.
+# 여기서의 모델 적용 경계는 모든 현실 유체 현상의 계산을 대체하지 않는다.
 def network_response(b,d,t,ag,installed=True,baseline_cache=None):
     """수평 두 축의 다층 건물과 연결된 물기둥들의 결합 운동을 적분한다."""
+    # network()가 선택한 형상을 수면 변환 S, 유속 변환 T 및 유체 행렬로 바꾸어 반환하는 지점.
     feet,up,leg,starts,ends,S,T,fluid_mass,fluid_k,coupling=network(d)
     modes=S.shape[1]
+    # Building의 층별 값이다. mount는 화면과 같은 1부터 시작하며 배열 접근 때만 1을 뺀다.
     masses,stiffness,story_height,mount=b.floor_data()
+    # q 구간: [장치 X(n), 장치 Y(n), 맨건물 X(n), 고정질량 X(n), 맨건물 Y(n), 고정질량 Y(n), 유체].
+    # 비교용 건물 좌표는 장치 유체와 결합하지 않으며 별도로 끝까지 적분한다.
     n=len(masses); fluid=6*n; size=fluid+modes
+    # 관과 물의 질량은 장치 설치 층의 구조 질량 대각항에 추가된다.
     added=d.mass+b.container_mass if installed else 0.
+    # M 질량[kg], K 강성[N/m], C 점성감쇠[N·s/m]. 유체와 비교 건물을 함께 보관할 배열이다.
     M=np.eye(size);K=np.zeros_like(M);C=K.copy()
+    # difference@u = [u1, u2-u1, ...]. 각 층간 스프링 힘을 양쪽 층에 조립한다.
     difference=np.eye(n)-np.eye(n,k=-1)
+    # 각 층의 스프링을 전단 건물 강성행렬로 조립한다. X 입력 k_i가 들어오는 지점이다.
     story=difference.T@(stiffness[:,None]*difference)
     omega=float(np.sqrt(np.linalg.eigvalsh(story/np.sqrt(masses[:,None]*masses[None,:]))[0]))
     for j,extra in ((0,added),(n,added),(2*n,0),(3*n,added)):
@@ -799,41 +900,56 @@ def network_response(b,d,t,ag,installed=True,baseline_cache=None):
         M[j+mount-1,j+mount-1]+=extra
         K[j:j+n,j:j+n]=story
         C[j:j+n,j:j+n]=2*b.damping/omega*story
+    # Y 강성 목록이 있으면 독립적으로 사용한다. 없을 때만 X와 같은 강성을 가정한다.
     ky=np.array(b.stories_y) if b.stories_y else stiffness
     story_y=difference.T@(ky[:,None]*difference)
+    # 세계 좌표의 건물 강성을 입력 지진의 진행 방향 좌표로 회전하기 위한 각도.
     theta=np.radians(b.bearing);co,si=np.cos(theta),np.sin(theta)
     xx=co*co*story+si*si*story_y
     yy=si*si*story+co*co*story_y
+    # X·Y 강성이 다르면 가진 좌표에서 비대각 결합항이 생긴다. 비틀림 자유도를 추가한 항은 아니다.
     xy=co*si*(story_y-story)
     for ix,iy,extra in ((0,n,added),(2*n,4*n,0),(3*n,5*n,added)):
         M[iy:iy+n,iy:iy+n]=np.diag(masses)
         M[iy+mount-1,iy+mount-1]+=extra
         K[ix:ix+n,ix:ix+n]=xx;K[iy:iy+n,iy:iy+n]=yy
         K[ix:ix+n,iy:iy+n]=xy;K[iy:iy+n,ix:ix+n]=xy
+    # 감쇠는 구조물 자유도에만 둔다. 유체의 비선형 오리피스 저항은 뒤에서 별도로 처리한다.
     C[:fluid,:fluid]=2*b.damping/omega*K[:fluid,:fluid]
     a=np.radians(d.angle+180*d.reverse)
     rot=np.array([[np.cos(a),-np.sin(a)],[np.sin(a),np.cos(a)]])
+    # 관 설치 상대각이 건물-유체 질량 결합에 반영된다. 관 없음이면 결합항이 0이다.
     cross=rot@coupling if installed else np.zeros_like(coupling)
+    # 선택한 설치 층의 X·Y 자유도 두 개에 유체를 연결한다. 다른 층에 직접 연결하지 않는다.
     attached=[mount-1,n+mount-1]
+    # 구조→유체와 유체→구조 항을 서로 전치로 넣어 질량행렬의 대칭성을 유지한다.
     M[attached,fluid:]=cross;M[fluid:,attached]=cross.T
     M[fluid:,fluid:]=fluid_mass;K[fluid:,fluid:]=fluid_k
+    # 좌표는 지반 상대변위. 가진 하중은 -M@[1(X건물),0(Y건물),...,0(유체)]*ag.
+    # M의 결합항 때문에 유체 행에도 올바른 지반 관성력이 생긴다.
     excitation=np.ones(size);excitation[n:2*n]=0;excitation[4*n:6*n]=0;excitation[fluid:]=0
+    # 실제 지반 관성하중은 뒤의 force*gm에서 -load*ag가 된다.
     load=M@excitation
+    # 실제 연성 부분만 중점법으로 풀고 비교 건물은 별도 계산하여 반복 행렬 크기를 줄인다.
     active=np.r_[np.arange(2*n),np.arange(fluid,size)]
     Ma=M[np.ix_(active,active)];Ka=K[np.ix_(active,active)];Ca=C[np.ix_(active,active)]
     la=load[active]
     full_mid=np.zeros(size)
     # 각 바닥 유로 평균속도에 동일한 개구비 경험식을 적용한다. 분기관 실측 보정은 미포함.
+    # 개구비 beta가 만든 xi를 사용한다. T가 반환한 각 유로 평균 유속에 같은 오리피스 기준을 적용한다.
     weights=np.full(len(starts),.5*1000*d.area*d.loss)
     flow_eye=np.eye(len(starts))
+    # 정지 수면에서 관 끝까지의 상승 여유. 비대칭 관은 기둥마다 값이 다를 수 있다.
     clearance=u_dimensions(d)[4]-leg if d.separate_u else d.freeboard/up[0,2]
     # 일반 원형 U관의 보수적인 전단면 충수 적용 경계.
     # 수평 관 중심선 z=0, 내측 천장 z=D/2. 접합부/자유수면의 3차원 형상은 미해석.
     # 이는 공기 유입을 확정하는 실험식이 아니라 고전 물기둥 모델의 적용 제한이다.
     standard_u=installed and equivalent_u(d)
+    # 수면 변화량의 하한이다. 기준이 정지 수면이므로 아래 방향은 음수이다.
     lower_rise=np.broadcast_to(-np.asarray(leg),S.shape[0]).copy()
     if standard_u:lower_rise+=d.diameter/2
     q=np.zeros(size);v=np.zeros(size)
+    # 시간별 좌표 Q와 속도 V. 계산하지 못한 구간은 NaN으로 남겨 정상 결과와 구분한다.
     Q=np.full((len(t),size),np.nan);V=Q.copy();Q[0]=q;V[0]=v
     try:
         chol=np.linalg.cholesky(Ma)
@@ -842,6 +958,7 @@ def network_response(b,d,t,ag,installed=True,baseline_cache=None):
     transformed=np.linalg.solve(chol,Ka)
     transformed=np.linalg.solve(chol,transformed.T).T
     fmax=np.sqrt(np.linalg.eigvalsh(transformed).max())
+    # 유체-구조 연성계의 가장 빠른 진동을 충분히 나누는 내부 간격. 입력 기록의 표본 간격과 다르다.
     stepmax=min(.01,2*np.pi/(INTERNAL_POINTS_PER_PERIOD*fmax))
     nvalid=1;failure=None;failure_kind=None;failure_detail="";last_h=None
     original_t=t;original_ag=ag
@@ -850,6 +967,7 @@ def network_response(b,d,t,ag,installed=True,baseline_cache=None):
         failure=float(t[0]);failure_kind='모델 적용 범위 초과'
         failure_detail=f'초기 상태 · 기둥 1·2 · h={d.h*1000:.3f} mm, 수평관 천장 D/2={d.diameter*500:.3f} mm. 전단면 충수를 보장할 수 없어 공기 유입 가능 상태의 유체 계산 제한.'
 
+    # 출력 기록의 각 구간을 내부 안정 간격으로 다시 나누고 ag는 선형 보간한다.
     for i,span in enumerate(np.diff(t),1):
         if failure is not None:break
         count=max(1,int(np.ceil(span/stepmax-1e-10)));dt=span/count;h=dt/2
@@ -859,13 +977,16 @@ def network_response(b,d,t,ag,installed=True,baseline_cache=None):
             # 1~3개의 가지 유속만을 미지수로 두는 중점법의 비선형 저항 방정식
             transfer=T@drag[-modes:]@T.T
             scalar_flow=len(weights)==1
+            # 유로가 하나인 경우 저항 방정식의 안정적인 닫힌 해를 사용해 반복 계산을 줄인다.
             if scalar_flow:
                 scalar_coefficient=float(transfer[0,0]*weights[0])
                 scalar_drag=drag[:,0]*float(T[0,0])*weights[0]
                 scalar_path=float(T[0,0])
             last_h=h
         for j in range(count):
+            # 입력 기록 두 표본 사이의 중간 시각 가속도. 단위는 m/s²이다.
             gm=ag[i-1]+(ag[i]-ag[i-1])*(j+.5)/count
+            # 비선형 오리피스 저항을 적용하기 전의 중점 속도 예측값.
             free=vm@v[active]+qm@q[active]+force*gm
             if scalar_flow:
                 rhs=scalar_path*float(free[-1])
@@ -874,6 +995,7 @@ def network_response(b,d,t,ag,installed=True,baseline_cache=None):
             else:
                 rhs=T@free[-modes:];flow=rhs.copy()
                 for _ in range(20):
+                    # 여러 유로는 유속과 저항의 연성 방정식을 Newton 반복으로 푼다. 수렴 실패는 오류로 보고한다.
                     residual=flow+transfer@(weights*abs(flow)*flow)-rhs
                     if max(abs(residual))<1e-11*(1+max(abs(rhs))):break
                     flow-=np.linalg.solve(flow_eye+transfer*(2*weights*abs(flow)),residual)
@@ -881,7 +1003,9 @@ def network_response(b,d,t,ag,installed=True,baseline_cache=None):
                 full_mid[active]=free-drag@(T.T@(weights*abs(flow)*flow))
             mid=full_mid
             old_q=q;old_v=v
+            # 중점 속도로 좌표를 업데이트한 뒤 중점 관계에서 다음 시각 속도를 계산한다.
             q=q+dt*mid;v=2*mid-v
+            # 유체 일반화 좌표를 화면에서 보는 각 기둥 수면 변화로 바꾼다. 단위는 m이다.
             rise=S@q[fluid:]
             if installed and (np.any(rise<=lower_rise) or np.any(rise>=clearance)):
                 old_rise=S@old_q[fluid:]
@@ -893,6 +1017,7 @@ def network_response(b,d,t,ag,installed=True,baseline_cache=None):
                     if rise[column]<=lower[column] or rise[column]>=upper[column]:
                         fraction=(bound-old_rise[column])/(rise[column]-old_rise[column])
                         candidates.append((float(np.clip(fraction,0,1)),column,rise[column]<=lower[column]))
+                # 한 내부 단계에서 여러 기둥이 경계에 닿으면 가장 먼저 닿은 사건을 선택한다.
                 fraction,column,is_lower=min(candidates)
                 q=old_q+fraction*(q-old_q);v=old_v+fraction*(v-old_v)
                 failure=t[i-1]+(j+fraction)*dt
@@ -906,16 +1031,19 @@ def network_response(b,d,t,ag,installed=True,baseline_cache=None):
                     Q=np.insert(Q,i,q,axis=0);V=np.insert(V,i,v,axis=0)
                 else:
                     Q[i]=q;V[i]=v
+                # 마지막 경계 상태까지 유효하게 저장한 표본 수. 전체 구간 저감률 산출 가능 여부와는 별개이다.
                 nvalid=i+1
                 break
         if failure is not None:break
         Q[i]=q;V[i]=v;nvalid+=1
+    # 이 아래는 TLCD 중단과 무관하게 원래 입력 끝까지 맨건물·고정질량 건물을 계산한다.
     baseline_blocks=[]
     for indices in (np.r_[np.arange(2*n,3*n),np.arange(4*n,5*n)],
                     np.r_[np.arange(3*n,4*n),np.arange(5*n,6*n)]):
         mb=M[np.ix_(indices,indices)];kb=K[np.ix_(indices,indices)];cb=C[np.ix_(indices,indices)]
         # 비교 대상도 TLCD와 같은 내부 시간 간격으로 적분한다.
         # 다른 간격의 기준 응답을 재사용하면 저감률에 수치 오차가 섞인다.
+        # 질량·강성·감쇠·내부 간격이 같을 때만 비교 건물 결과를 재사용한다.
         cache_key=(mb.tobytes(),kb.tobytes(),cb.tobytes(),stepmax)
         stored=baseline_cache.get(cache_key) if baseline_cache is not None else None
         if stored is None:
@@ -939,6 +1067,8 @@ def network_response(b,d,t,ag,installed=True,baseline_cache=None):
         for column,index in enumerate(indices):
             Q[:,index]=np.interp(t,original_t,stored[0][:,column])
             V[:,index]=np.interp(t,original_t,stored[1][:,column])
+    # 상대 운동식 M*q'' = -K*q-C*q'-저항-M*r*ag 에 ag를 더하면 절대가속도가 된다.
+    # 아래 force에는 -M*r*ag를 넣지 않으므로 solve(M,force)가 곧 절대가속도다.
     force=-np.nan_to_num(Q)@K.T-np.nan_to_num(V)@C.T
     currents=np.nan_to_num(V[:,fluid:])@T.T
     force[:,fluid:]-=(weights*abs(currents)*currents)@T
@@ -946,14 +1076,18 @@ def network_response(b,d,t,ag,installed=True,baseline_cache=None):
     acc[:,active]=np.linalg.solve(Ma,force[:,active].T).T
     for indices,mb in baseline_blocks:
         acc[:,indices]=np.linalg.solve(mb,force[:,indices].T).T
+    # 유체 계산이 끝난 뒤의 장치 건물 가속도는 미계산이므로 NaN 처리한다.
     acc[nvalid:,:2*n]=np.nan
     heights=(Q[:,fluid:]@S.T)*up[:,2]
     speeds=(V[:,fluid:]@S.T)*up[:,2]
     dt=np.diff(t);vg=np.r_[0,np.cumsum(dt*(ag[:-1]+ag[1:])/2)]
+    # 가속도를 구간별로 두 번 적분한 지면 변위. 단방향 사인 가진 화면은 done()에서 알려진 해로 표시한다.
     ground=np.r_[0,np.cumsum(dt*vg[:-1]+dt**2*(2*ag[:-1]+ag[1:])/6)]
     floors_x=Q[:,:n];floors_y=Q[:,n:2*n]
     travel=np.nanmax(np.hypot(floors_x[:nvalid],floors_y[:nvalid]))+max(abs(ground[:nvalid]))
     roof=n-1;bare=3*n-1;fixed=4*n-1
+    # 결과를 사전으로 반환한다. state/acc의 열 순서는 metrics() 주석을 참조한다.
+    # floors_x/floors_y는 모든 층의 상대 변위, levels는 각 물기둥의 정지 수면 대비 변화이다.
     return dict(t=t,ag=ag,ground=ground,first=Q[:,[0,n]],travel=travel,installed=installed,
         integration_max_step_s=stepmax,
         floors_x=floors_x,floors_y=floors_y,floors_acc=acc[:,:n],floor_bare=Q[:,2*n:3*n],
@@ -969,6 +1103,8 @@ def network_response(b,d,t,ag,installed=True,baseline_cache=None):
         valid=failure is None,failure_time=failure,n_valid=nvalid)
 
 
+
+# 주 GUI·비교·최적화가 함께 사용하는 진입점. 입력 검증 후 network_response()에 전달한다.
 def simulate_space(b, d, t, ag, installed=True,*,_baseline_cache=None):
     """수평 두 방향의 지붕 운동과 두 수면의 연직 운동을 결합한다.
 
@@ -985,6 +1121,7 @@ def simulate_space(b, d, t, ag, installed=True,*,_baseline_cache=None):
     return network_response(b,d,t,ag,installed,_baseline_cache)
 
 
+# 현재 3D 실험의 표·그림·요약 저장. 물리 한계와 부분 구간의 평가 범위를 함께 기록한다.
 def export_space(folder, b, d, r, title):
     plt = setup_plot()
     if r.get('installed',True):
@@ -1011,6 +1148,8 @@ def export_space(folder, b, d, r, title):
                delimiter=',',comments='')
 
 
+# 지진 기록 모드의 방향과 가상 거리 배율. 사용자가 지정한 위치는 방향과 경험적 크기 조절에 사용한다.
+# 실제 지진파 전파·도달 시각·주파수별 감쇠·지반 증폭을 계산하는 진원 모델은 아니다.
 @dataclass(frozen=True)
 class Source:
     east: float = -6
@@ -1049,6 +1188,8 @@ def write_settings(path,data):
     temporary.replace(path)
 
 
+# GUI 조립, 입력 적용, 작업 스레드 및 결과 표시를 담당한다.
+# 작업 스레드는 숫자 계산을, Tkinter 메인 스레드는 위젯 변경을 담당한다.
 def lab(b,d,t,ag,title,out):
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
@@ -1113,10 +1254,12 @@ def lab(b,d,t,ag,title,out):
     omega_b=tk.StringVar(value=f'{2*math.pi*b.frequency:.9g}')
     omega_l=tk.StringVar(value=f'{2*math.pi*d.frequency:.9g}')
     tune_mode=tk.BooleanVar(value=False)
+    frequency_widgets={}
     for label,var in [('건물 ω (rad/s)',omega_b),('TLCD ω (rad/s)',omega_l)]:
         row=ttk.Frame(freq_page);row.pack(fill='x',pady=4)
         ttk.Label(row,text=label).pack(side='left')
         entry=ttk.Entry(row,textvariable=var,width=11);entry.pack(side='right')
+        frequency_widgets[label]=entry
     def switch_tune():
         entry.configure(state='normal' if tune_mode.get() else 'readonly')
         if not tune_mode.get(): preview_frequency()
@@ -1225,7 +1368,10 @@ def lab(b,d,t,ag,title,out):
         dimension_labels[key]=tk.StringVar(value=label)
         ttk.Label(row,textvariable=dimension_labels[key]).pack(side='left')
         fields[key]=tk.StringVar(value=f'{value:g}')
-        ttk.Entry(row,textvariable=fields[key],width=8).pack(side='right')
+        input_entry=ttk.Entry(row,textvariable=fields[key],width=8)
+        if key=='h':input_entry.configure(state='readonly')
+        input_entry.pack(side='right')
+    ttk.Label(pipe_page,text='h는 물 질량·안지름·B에서 계산되는 결과값입니다.',wraplength=280).pack(anchor='w')
     ttk.Label(pipe_page,text='관 방향은 동쪽 0° · 북쪽 90°').pack(anchor='w',pady=4)
     tune_ratio=tk.StringVar(value=f'{d.frequency/b.frequency:.8g}')
     ratio_enabled=tk.BooleanVar(value=False)
@@ -1236,14 +1382,30 @@ def lab(b,d,t,ag,title,out):
     ttk.Entry(pipe_page,textvariable=water_var,width=10).pack(anchor='w')
     ttk.Label(pipe_page,text='오리피스 손실만 근사 · 분기관 경험식 적용 불확실',wraplength=250).pack(anchor='w')
     def preview_frequency(*_):
-        if tune_mode.get(): return
+        # 실제 적용과 동일한 입력 경로를 사용한다. h 입력란은 계산 결과 표시용이다.
+        if tune_mode.get():return
         try:
-            length=(float(fields['B'].get())+2*float(fields['h'].get()))/100
+            width=float(fields['B'].get())/100
+            diameter=float(fields['diameter'].get())/100
+            # 물 질량이 기준 입력이다. 화면의 이전 h를 사용하지 않고 부피식으로 다시 구한다.
+            mass=float(water_var.get())
+            if min(width,diameter,mass)<=0:raise ValueError('양수가 필요합니다.')
+            height=(mass/(1000*np.pi*diameter**2/4)-width)/2
+            if height<=0:raise ValueError('수직부에 남는 물이 없습니다.')
             bores,tops=leg_specs.get(shape_var.get(),((),()))
-            trial=replace(d,bores=bores,tops=tops,columns=int(column_var.get()),shape=shape_var.get(),B=float(fields['B'].get())/100,h=float(fields['h'].get())/100,tilt=float(tilt_var.get()))
-            omega_l.set(f'{2*np.pi*trial.frequency:.9g}' if min(trial.B,trial.h,trial.tilt)>0 else '')
-        except (ValueError,ZeroDivisionError): omega_l.set('')
-    for key in ('B','h'): fields[key].trace_add('write',preview_frequency)
+            trial=replace(d,bores=bores,tops=tops,columns=int(column_var.get()),shape=shape_var.get(),
+                B=width,h=height,diameter=diameter,tilt=float(tilt_var.get()))
+            fields['h'].set(f'{height*100:.9g}')
+            omega_l.set(f'{2*np.pi*trial.frequency:.9g}')
+        except (ValueError,ZeroDivisionError,np.linalg.LinAlgError):
+            omega_l.set('입력 확인')
+    for key in ('B','diameter'):fields[key].trace_add('write',preview_frequency)
+    water_var.trace_add('write',preview_frequency)
+    column_var.trace_add('write',preview_frequency)
+    def stiffness_input_state(*_):
+        frequency_widgets['건물 ω (rad/s)'].configure(state='normal' if stiffness_mode.get()=='목표 X 1차 진동수' else 'readonly')
+    stiffness_mode.trace_add('write',stiffness_input_state)
+    stiffness_input_state()
     update_dimension_labels()
     def change_shape(_):
         update_dimension_labels()
@@ -1605,6 +1767,7 @@ def lab(b,d,t,ag,title,out):
         chart.create_line(px,14,px,117,fill='#8392a0',dash=(3,3),tags='cursor')
 
     def draw_chart(*_):
+        # 현재 적용 완료된 결과를 읽는다. 아직 적용하지 않은 입력란 값으로 그래프를 다시 계산하지 않는다.
         dam,r=current
         idx=choices.index(graph_type.get())
         off=not r.get('installed',True)
@@ -1612,6 +1775,7 @@ def lab(b,d,t,ag,title,out):
         elif idx==0: arrays=r['state'][:,[4,6,0]]*1000
         elif idx==1: arrays=r['acc']/G
         elif idx==2: arrays=(r['levels']+r['rest_height'] if 'levels' in r else d.h+r['state'][:,2:3])*1000
+        # 「측정 층」에서 선택한 층의 장치 있음/없음 응답을 꺼내 같은 축에 그린다.
         elif idx>=5:
             k=int(view_floor.get())-1
             base=r['floor_bare'];active=r['floors_x']
@@ -1630,6 +1794,7 @@ def lab(b,d,t,ag,title,out):
         else: legend.set('파랑  TLCD를 설치한 모형')
         if off and idx!=4: legend.set('관 없음 · 건물 응답' if idx!=2 else '관 없음 · 물 높이 측정 대상 없음')
         if idx>=5 and not off: legend.set(f'{view_floor.get()}층   ·   회색  장치 없음       파랑  현재 TLCD')
+        # 계산 결과의 SI 단위를 화면용 mm, g, % 등으로 변환해 축 이름에 표시한다.
         unit=['mm','g','mm','mm','mm','mm','m/s²','%'][idx]
         n=r['n_valid']; width=chart.winfo_width()
         chart.delete('all')
@@ -1660,6 +1825,7 @@ def lab(b,d,t,ag,title,out):
         chart.create_text(65,130,text='0 초',anchor='w')
         chart.create_text(width-20,130,text=f'{t[-1]:g} 초',anchor='e')
         draw_scene()
+
     def refresh():
         dam,r=current
         count=r['floors_x'].shape[1]
@@ -1723,13 +1889,19 @@ def lab(b,d,t,ag,title,out):
     def calculate(keep_time=False):
         nonlocal ag
         previous_time=position.get() if keep_time else 0.
+        # 「관 있음/없음」의 선택값이다. False이면 유체 결합과 추가 관 질량을 제거한다.
         enabled=pipe_on.get()
         try:
+            # 화면 문자열 → 숫자. cm 입력(B,h,D)은 아래에서 m로 변환한다.
             vals={key:float(field.get()) for key,field in fields.items()}
+            # 화면의 cm를 내부 계산 단위 m로 바꾸는 위치. angle·beta는 여기서 변환하지 않는다.
             for key in ['B','h','diameter']: vals[key]/=100
             wb=float(omega_b.get())
             if not math.isfinite(wb) or wb<=0: raise ValueError('건물 각진동수는 양수여야 합니다.')
+            # 층별 입력란의 쉼표 문자열을 숫자 튜플로 만든다.
+            # 'm'→질량, 'k'→X 층간 강성, 'y'→Y 층간 강성, 'h'→층 높이. 관 물높이 h와 다른 값이다.
             lists={key:tuple(float(i.strip()) for i in field.get().split(',')) for key,field in floor_fields.items()}
+            # 「건물 층수」에 맞춰 목록을 자르거나 마지막 층 값을 복사한다. 기존 층의 입력값은 유지한다.
             wanted=int(count_var.get())
             if wanted<1:raise ValueError('층수는 1 이상의 정수여야 합니다.')
             previous=len(b.floor_data()[0])
@@ -1747,26 +1919,34 @@ def lab(b,d,t,ag,title,out):
                 raise ValueError('질량·강성·높이의 개수를 맞추고, 설치 층을 1층부터 마지막 층 사이로 입력하세요.')
             if any(not math.isfinite(v) or v<=0 for arr in lists.values() for v in arr):
                 raise ValueError('질량, 강성, 높이는 모두 유한한 양수여야 합니다.')
+            # 「건물 크기 연동」을 선택한 경우에만 고정 기준 면적 대비 질량을 계산한다.
+            # 기준 질량을 사용하므로 조건 적용을 반복해도 면적비가 누적 곱해지지 않는다.
             if size_link.get():
                 refmass=reference_size[2]
                 if len(refmass)!=count:raise ValueError('크기 연동 기준 층수와 현재 층수가 다릅니다. 수동 모드를 사용하세요.')
                 factor=(float(size_vars[0].get())/100*float(size_vars[1].get())/100)/(reference_size[0]*reference_size[1])
                 masses=tuple(refmass*factor)
             diff=np.eye(count)-np.eye(count,k=-1)
+            # 장치 없는 건물의 X방향 1차 omega를 현재 질량·X 강성으로 계산한다.
             actual=modes(np.diag(masses),diff.T@(np.array(ks)[:,None]*diff))[0][0]
+            # 목표 모드에서만 X 강성 전체를 (목표 omega/현재 omega)²배 한다. Y 강성은 이 줄에서 바꾸지 않는다.
             if stiffness_mode.get()=='목표 X 1차 진동수':
                 ks=tuple(k*(wb/actual)**2 for k in ks);actual=wb
+            # 위에서 확정한 질량·강성·치수를 Building에 넣는다. 이후 실제 M/K/C 조립의 입력이 된다.
             target_b=replace(b,stories_y=lists['y'],damping=float(damping_var.get()),width=float(size_vars[0].get())/100,depth=float(size_vars[1].get())/100,mass=sum(masses),frequency=actual/(2*np.pi),masses=masses,stories=ks,heights=hs,mount=mount)
             mass=float(water_var.get())
             if not np.isfinite(mass) or mass<=0:raise ValueError('물 질량은 양수여야 합니다.')
+            # 질량 m=rho*A*(B+2h), A=pi*D²/4를 h에 대해 푼 식. 현재 h 입력칸은 이 결과를 표시한다.
             vals['h']=(mass/(1000*np.pi*vals['diameter']**2/4)-vals['B'])/2
             if vals['h']<=0:raise ValueError('물이 바닥 관을 채우기에 부족합니다. B를 줄이거나 물 질량을 늘리세요.')
+            # 「U관 기둥별 안지름·높이」의 사용자 설정을 선택 형상의 관 정보에 합친다.
             bores,tops=leg_specs.get(shape_var.get(),((),()))
             vals.update(shape=shape_var.get(),tilt=float(tilt_var.get()),columns=int(column_var.get()),bores=bores,tops=tops)
             if ratio_enabled.get():
                 ratio=float(tune_ratio.get())
                 if not np.isfinite(ratio) or ratio<=0:raise ValueError('조율비는 양수여야 합니다.')
                 omega_l.set(str(ratio*actual));tune_mode.set(True)
+            # 「TLCD 목표값으로 물 높이 조절」을 켠 경우에만 목표 omega에 맞는 h를 찾는다.
             if tune_mode.get():
                 wl=float(omega_l.get())
                 if not math.isfinite(wl) or wl<=0: raise ValueError('TLCD 각진동수는 양수여야 합니다.')
@@ -1785,12 +1965,15 @@ def lab(b,d,t,ag,title,out):
                     else:hi=mid
                 vals['h']=(lo+hi)/2
             if tune_mode.get():
+                # 목표 h를 구한 다음 안지름을 조절하여 총 물 질량을 입력값으로 되돌린다.
                 scale=math.sqrt(mass/(1000*np.pi*vals['diameter']**2/4*(vals['B']+2*vals['h'])))
                 vals['diameter']*=scale
                 vals['bores']=tuple(None if x is None else x*scale for x in vals['bores'])
                 fields['diameter'].set(f"{vals['diameter']*100:.9g}")
+            # Damper에 확정 입력을 넣고 길이·개구비·설치 조건을 검사한다. 아직 방향은 화면의 세계 방위이다.
             raw=replace(d,**vals); validate(target_b,raw)
             kind=kind_var.get()
+            # 단방향은 실험실 Hz/진폭만 사용. 지진 기록 모드에서만 진원·거리·세기 입력을 사용한다.
             if kind=='단방향':
                 timeline,signal,meta=laboratory_input(float(hz_var.get()),
                     float(amplitude_var.get()),amplitude_mode.get())
@@ -1802,10 +1985,13 @@ def lab(b,d,t,ag,title,out):
                 timeline,input_wave=wave_cache[kind]
                 signal,relative,meta=quake.input_for(input_wave,raw.angle)
                 meta['harmonic_hz']=None
+            # 가진 방위를 저장한다. 건물의 X/Y 강성행렬을 가진 방향 좌표로 회전할 때 사용한다.
             target_b=replace(target_b,bearing=meta['bearing_deg'])
             meta['wave']=kind
             meta['heading_deg']=raw.angle
+            # 화면 관 방위에서 가진 방위를 뺀 상대각을 실제 연성 계산에 전달한다.
             dam=replace(raw,angle=relative,reverse=(raw.angle-meta['bearing_deg'])%360>=180)
+            # 캐시 키에는 실제 계산을 바꾸는 모든 설정과 가진 진폭·주파수를 포함한다.
             key=(quake,raw,target_b,enabled,kind,meta.get('harmonic_hz'),
                 meta.get('amplitude_mode'),meta.get('amplitude_value'))
         except ValueError as error:
@@ -1830,6 +2016,7 @@ def lab(b,d,t,ag,title,out):
             fields['h'].set(f'{dam.h*100:.9g}')
             omega_l.set(f'{2*np.pi*dam.frequency:.9g}')
             tune_ratio.set(f'{dam.frequency/b.frequency:.8g}')
+            # 결과에는 계산에 사용한 건물의 스냅샷을 붙인다. 뒤에 입력을 바꿔도 이전 실험은 유지된다.
             r['building_spec']=target_b
             cache[key]=r; r['source']=meta; current[:]=[dam,r]
             location=(f"실험실 {meta['harmonic_hz']:g} Hz · 변위 진폭 {meta['displacement_amplitude_m']*100:g} cm" if kind=='단방향'
@@ -1842,7 +2029,10 @@ def lab(b,d,t,ag,title,out):
             position.set(min(previous_time,t[r['n_valid']-1]));draw_scene()
             persist_last()
             status.set(r.get('failure_detail') or ('주의 · 정지 물높이 1 cm 미만' if dam.h<.01 else '계산 완료 · 비교 목록에 담을 수 있어요.'))
+        # 이미 같은 조건을 계산했으면 결과를 재사용한다. 새 계산은 작업 스레드에서 simulate_space()를 실행한다.
+        # 작업 완료 후 done()이 입력 표시와 3D 화면을 갱신한다.
         task(lambda:cache[key] if key in cache else simulate_space(target_b,dam,timeline,signal,enabled),done)
+
     def save():
         path=filedialog.askdirectory(title='저장할 폴더 선택')
         if path:
@@ -1972,6 +2162,7 @@ def lab(b,d,t,ag,title,out):
             if run_state['running']:return
             update_fields()
             try:
+                # 화면의 탐색 범위와 고정값으로 실제 계산할 격자를 만든다. 예상 조합 수도 이 격자에서 센다.
                 g=grids()
                 varied=selectable if full.get() else [xvar.get(),yvar.get()]
                 explanation.set('탐색 · '+', '.join(labels[k] for k in varied)+' / 유지 · '+(', '.join(f'{labels[k]}={fixed[k].get()}' for k in keys if k not in varied) or '없음'))
@@ -2005,6 +2196,7 @@ def lab(b,d,t,ag,title,out):
                 try:requested[key]=float(fixed[key].get())
                 except ValueError:requested[key]=context['fixed'][key]
             projection=view_mode.get()=='전체 최적화 결과 투영도'
+            # 단면도는 존재하는 고정 조합을 선택하고, 투영도는 각 X·Y 칸의 최고 RMS 실제 행을 선택한다.
             section,snapped=select_performance_rows(rows,xx,yy,requested,projection)
             context.update(view_mode=view_mode.get(),view_fixed=snapped)
             if not projection:
@@ -2016,6 +2208,7 @@ def lab(b,d,t,ag,title,out):
             displayed.update(cells={(float(row[xx]),float(row[yy])):row for row in section},axes=ax)
             table_caption.set('실제 계산 결과 · '+view_mode.get()+' · '+context['source']+' · 표시 단면 '+str(snapped))
 
+            # 계산값이 없는 칸은 NaN으로 유지한다. 보간으로 성능값을 만들어 채우지 않는다.
             matrix=np.full((len(ys),len(xs)),np.nan)
             markers={'정상':'o','최대 변위 악화':'x','수면 상한 도달':'^','수면 하한 도달':'v','모델 적용 범위 초과':'^','초기 충수 조건 미달':'P','잘못된 설계':'s','계산 오류':'D'}
             for row in section:
@@ -2088,6 +2281,7 @@ def lab(b,d,t,ag,title,out):
             try:g=grids();rule=peak_rule.get()
             except ValueError as error:feedback.set(str(error));return
             if pending[0]:win.after_cancel(pending[0]);pending[0]=None
+            # 계산 시작 시 입력 조건을 복사한다. 이후 결과표·그림·CSV는 이 계산 조건을 참조한다.
             context=dict(x=xvar.get(),y=yvar.get(),fixed={k:float(g[k][0]) if full.get() or k in (xvar.get(),yvar.get()) else float(v.get()) for k,v in fixed.items()},
                 grids={k:v.tolist() for k,v in g.items()},full=full.get(),require_peak=rule,
                 building=asdict(model),damper=asdict(dam),source=source_description,source_metadata=source_metadata,
@@ -2102,6 +2296,7 @@ def lab(b,d,t,ag,title,out):
                 if run_state['running']:win.after(100,monitor)
             monitor()
             def compute():
+                # 작업 스레드의 탐색 실행. stop과 progress는 중지 요청·진행 상황 전달에 사용한다.
                 rows=search_designs(model,dam,times,wave,g['beta'],g['angle'],g['B'],rule,g['r'],g['n'],memo,
                     stop=run_state['cancel'],progress=run_state['progress'])
                 context['stopped']=run_state['cancel'].is_set()
@@ -2117,6 +2312,7 @@ def lab(b,d,t,ag,title,out):
                     draw(rows)
                     p=run_state['progress']
                     progress_text.set(f"{'중지됨' if context['stopped'] else '완료'} · 평가 {len(rows)} / {p.get('total',0)} · 캐시 {p.get('reused',0)} · 미계산 {p.get('total',0)-len(rows)}")
+            # 계산은 백그라운드에서, 결과 표시와 입력 잠금 해제는 Tkinter 메인 스레드에서 수행한다.
             task(compute,display,on_finish=unlock_inputs)
         def swap():
             x,y=xvar.get(),yvar.get();xvar.set(y);yvar.set(x)
@@ -2418,7 +2614,7 @@ def lab(b,d,t,ag,title,out):
             '모양 선택만 바꾸면 물 총부피와 빈 관 질량이 유지됩니다. 바닥 총길이 B를 가지에 나누고, 기준 U형 물 높이 h의 두 배를 모든 다리에 나눕니다. V형은 수평 기준 경사각이며 피자 거치대는 120도 간격 3개, 다기둥형은 일렬 2~24개입니다. 독립 U관 3개는 같은 설치 층에 고정되며 관마다 좌우 물 부피 변화가 상쇄됩니다. 기둥 안지름을 바꾸면 물의 양을 유지하도록 정지 수면을 다시 계산합니다. 그림의 차단판 효과는 손실계수로 근사합니다.\n\n'
             '진원 좌표는 건물을 기준으로 입력합니다. 가상 지진은 진원에서 건물로 향하는 수평선 방향으로 흔들린다고 가정합니다. 바로 아래 진원은 동쪽을 기준으로 사용합니다.\n\n'
             '세기는 진원 거리 10 km에서의 최대 가속도(g)입니다. 같은 파형에 거리 계수 √101 / √(거리²+1)을 곱합니다(거리 단위 km). 모든 기록은 진동 도착 시점부터 비교합니다. 실제 지반, 지진 규모, 파의 도착시간은 계산 범위 밖입니다.\n\n'
-            '오리피스 개구비 경험식만 적용하며 관벽 마찰·곡관 손실은 생략합니다. 분기관과 비대칭 관에서 경험식 적용 범위는 검증되지 않았습니다.\n\n물은 관을 따라 움직이는 한 물기둥으로 계산합니다. 물의 관성, 두 수면 높이 차에 따른 중력, 유속의 제곱에 비례하는 저항이 들어갑니다. 3D 화면은 이 계산값을 보여줍니다.\n\n건물은 선형 전단 모형으로 비틀림, 전도 회전, 소성 및 지반-기초 상호작용은 포함하지 않습니다. 물의 기포, 부분 충수, 접합부 3차원 흐름은 계산 범위 밖입니다. 이 효과의 계수와 구조 자료 없이 실제 응답을 보정했다고 주장할 수 없습니다.')
+            '입력 적용 안내 · 물높이 h는 물 질량·관 안지름·B로 자동 계산합니다. 직접 강성 모드의 건물 omega는 결과 표시용입니다. 단방향 가진에서는 진원/세기 입력을 사용하지 않습니다.\n\n오리피스 개구비 경험식만 적용하며 관벽 마찰·곡관 손실은 생략합니다. 분기관과 비대칭 관에서 경험식 적용 범위는 검증되지 않았습니다.\n\n물은 관을 따라 움직이는 한 물기둥으로 계산합니다. 물의 관성, 두 수면 높이 차에 따른 중력, 유속의 제곱에 비례하는 저항이 들어갑니다. 3D 화면은 이 계산값을 보여줍니다.\n\n건물은 선형 전단 모형으로 비틀림, 전도 회전, 소성 및 지반-기초 상호작용은 포함하지 않습니다. 물의 기포, 부분 충수, 접합부 3차원 흐름은 계산 범위 밖입니다. 이 효과의 계수와 구조 자료 없이 실제 응답을 보정했다고 주장할 수 없습니다.')
     for label,cmd in [('조건 적용',calculate),('최적 설계 탐색',optimize),('현재 실험 담기',remember),('실험 그래프 비교',history_window),('각도별 그래프 비교',angle_window),('형상 × 각도 비교',compare),('결과 저장',save),('물과 지진 계산 원리',model_info)]:
         ttk.Button(panel,text=label,command=cmd).pack(fill='x',pady=3)
     ttk.Separator(panel).pack(fill='x',pady=12)
@@ -2462,13 +2658,16 @@ def lab(b,d,t,ag,title,out):
         omega_b=omega_b,omega_l=omega_l,tune=tune_mode,ratio=tune_ratio,
         ratio_enabled=ratio_enabled,pipe_on=pipe_on)
     def snapshot():
+        # 현재 화면의 문자열·선택 상태를 그대로 저장한다. 여기서 새 물리 계산을 수행하지 않는다.
         data=dict(values={k:v.get() for k,v in variables.items()},
             groups={name:{k:v.get() for k,v in group.items()} for name,group in variable_groups.items()},
             legs=leg_specs,reference_size=[reference_size[0],reference_size[1],reference_size[2].tolist()])
+        # 사용자가 불러온 별도 입력 기록은 재실행 후에도 복원할 수 있도록 배열을 함께 저장한다.
         if kind_var.get() not in QUAKE_NOTES:
             time_input,acc_input=wave_cache[kind_var.get()]
             data['custom_wave']=[time_input.tolist(),acc_input.tolist()]
         return data
+
     def persist_last():
         saved['last']=snapshot()
         try:write_settings(settings_path,saved)
@@ -2479,6 +2678,7 @@ def lab(b,d,t,ag,title,out):
         if playback['busy']:
             messagebox.showinfo('설정','계산이 끝난 뒤 불러오세요.');return
         try:
+            # 설정 JSON의 values는 일반 입력, groups는 관·층별·진원 입력 묶음이다.
             values=data['values'];groups=data['groups']
             reference=data['reference_size']
             restored_reference=(float(reference[0]),float(reference[1]),np.array(reference[2],float))
@@ -2488,6 +2688,7 @@ def lab(b,d,t,ag,title,out):
                 kind_box.configure(values=list(presets))
             # 진폭 항목이 없는 예전 설정에도 실행용 기본값을 적용한다.
             amplitude_mode.set('가속도 진폭 (g)');amplitude_var.set('0.01')
+            # 알고 있는 키만 위젯 변수에 복원한다. 오래된 설정에 없는 입력은 현재 기본값을 유지한다.
             for key,value in values.items():
                 if key in variables:variables[key].set(value)
             for name,group in groups.items():
@@ -2496,12 +2697,15 @@ def lab(b,d,t,ag,title,out):
             leg_specs.clear()
             leg_specs.update({k:tuple(tuple(x) for x in pair) for k,pair in data['legs'].items()})
             ratio_enabled.set(False)
+            # 크기 연동의 기준 치수·질량을 함께 복원해 질량 누적 변경을 방지한다.
             reference_size=restored_reference
             wave_note.set(presets[kind_var.get()])
             update_dimension_labels();switch_tune()
+            # 복원한 입력을 실제 계산에 적용하는 지점. 성공하면 마지막 적용 설정도 다시 저장된다.
             calculate()
         except (KeyError,TypeError,ValueError) as error:
             messagebox.showerror('설정 불러오기',f'설정 내용을 확인하세요.\n{error}')
+
     def save_named():
         from tkinter import simpledialog
         if playback['busy']:
@@ -2554,6 +2758,7 @@ def vector(label, values, size, *, positive_only=False):
     return a
 
 
+# 별도 U형 모드 분석용 M/K/C 조립. 주 GUI의 Building 설정을 직접 변경하지 않는다.
 def building():
     if not isinstance(N, int) or N < 1:
         raise ValueError('N은 1 이상의 정수여야 합니다.')
@@ -2572,6 +2777,7 @@ def building():
     return M,K,C,heights
 
 
+# 대칭 일반화 고유치 문제 K*phi=omega²*M*phi를 풀어 질량 정규화 모드와 참여계수를 반환한다.
 def modes(M, K):
     # 대칭 고유치 문제로 변환한 뒤 질량 정규화: phi.T M phi = I.
     root = np.sqrt(np.diag(M))
@@ -2617,6 +2823,7 @@ def designs(omega, install=INSTALL_FLOOR, locations=FLOORS):
     return result
 
 
+# 별도 한 방향 U형 모델의 결합 M/K/C, 가진 방향 벡터, 비선형 저항계수를 구성한다.
 def system(M,K,C,p):
     if p is None:
         return M,K,C,np.ones(len(M)),0.
@@ -2669,6 +2876,7 @@ def record_input(t, base_path):
     return t,acc,forces
 
 
+# 별도 U형 분석의 암시적 중점 적분. 주 GUI의 network_response()와 진입점이 다르다.
 def integrate(model,p,t,ag,forces,*,rest=False):
     """암시적 중점법. 가진 선형 보간, 비선형 손실은 매 내부 단계에서 풀어낸다."""
     N=len(model[0])
@@ -2805,6 +3013,7 @@ def sweep_group(model, entries, time, ground, steps, window_start):
     return ret
 
 
+# 별도 주파수 실험. SWEEP_AMPLITUDE와 SWEEP_CYCLES를 사용하며 현재 실측 기록의 FFT가 아니다.
 def run_sweep(model,cases):
     N=len(model[0])
     if not SWEEP_HZ:return []
@@ -2934,6 +3143,8 @@ def graphs(t,model,phi,omega,cases,results,rows,freq_rows):
 
 
 
+# 별도 U형 설계 분석. snapshot이 있으면 건물 X 강성과 해당 입력 기록을 사용한다.
+# 다른 관 형상·평면 Y 강성·3D 장치 회전을 이 한 방향 모델에 자동 반영하지 않는다.
 def calculate_multistory(snapshot=None):
     location=globals().get("__file__")
     script_dir=Path(location).resolve().parent if location else Path.cwd()
@@ -3091,6 +3302,7 @@ def export_multistory(path,r,figures):
 
 
 
+# 명령행 인자를 읽고 기본 건물·관·가진을 만든다. GUI 설정은 lab()에서 읽고 적용한다.
 def main():
     parser=argparse.ArgumentParser(description='TLCD 3D 실험실')
     parser.add_argument('--headless',action='store_true')
